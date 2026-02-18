@@ -45,7 +45,7 @@ impl AssFs {
         let log_path = data_dir.join("assfs.log");
 
         // Run recovery before anything else.
-        let recovery_result = recovery::recover(&log_path, &store)?;
+        let recovery_result = recovery::recover(&log_path, &store, &graph)?;
         log::info!("Recovery: {:?}", recovery_result);
 
         let mut txn_mgr = TransactionManager::open(&log_path)?;
@@ -338,16 +338,31 @@ impl Filesystem for AssFs {
         // Create new file node.
         let file_id = uuid::Uuid::new_v4();
         let file_node = GraphNode::new_file(file_id, req.uid(), req.gid(), mode);
-        self.store.register_empty(file_id);
+        let node_data = bincode::serialize(&file_node).unwrap_or_default();
 
-        // Log the creation.
-        if let Err(_) = txn_mgr.log_write(txn_id, file_id, None, Some(EMPTY_HASH)) {
+        // Log node addition, edge addition, and content registration.
+        if txn_mgr
+            .log_add_node(txn_id, file_id, node_data)
+            .is_err()
+            || txn_mgr
+                .log_add_edge(
+                    txn_id,
+                    parent_id,
+                    file_id,
+                    EdgeType::Child,
+                    name_str.to_string(),
+                )
+                .is_err()
+            || txn_mgr
+                .log_content_change(txn_id, file_id, None, Some(EMPTY_HASH))
+                .is_err()
+        {
             let _ = txn_mgr.abort_txn(txn_id);
             reply.error(libc::EIO);
             return;
         }
 
-        // Add node and edge to graph.
+        // Apply to in-memory state.
         self.graph.add_node(file_node.clone());
         if let Err(_) = self.graph.add_edge(
             parent_id,
@@ -359,6 +374,7 @@ impl Filesystem for AssFs {
             reply.error(libc::EIO);
             return;
         }
+        self.store.register_empty(file_id);
 
         // Commit.
         if let Err(_) = txn_mgr.commit_txn(txn_id) {
@@ -415,14 +431,31 @@ impl Filesystem for AssFs {
 
         let dir_id = uuid::Uuid::new_v4();
         let dir_node = GraphNode::new_dir(dir_id, req.uid(), req.gid(), mode);
-        self.store.register_empty(dir_id);
+        let node_data = bincode::serialize(&dir_node).unwrap_or_default();
 
-        if let Err(_) = txn_mgr.log_write(txn_id, dir_id, None, Some(EMPTY_HASH)) {
+        // Log node addition, edge addition, and content registration.
+        if txn_mgr
+            .log_add_node(txn_id, dir_id, node_data)
+            .is_err()
+            || txn_mgr
+                .log_add_edge(
+                    txn_id,
+                    parent_id,
+                    dir_id,
+                    EdgeType::Child,
+                    name_str.to_string(),
+                )
+                .is_err()
+            || txn_mgr
+                .log_content_change(txn_id, dir_id, None, Some(EMPTY_HASH))
+                .is_err()
+        {
             let _ = txn_mgr.abort_txn(txn_id);
             reply.error(libc::EIO);
             return;
         }
 
+        // Apply to in-memory state.
         self.graph.add_node(dir_node.clone());
         if let Err(_) =
             self.graph
@@ -432,6 +465,7 @@ impl Filesystem for AssFs {
             reply.error(libc::EIO);
             return;
         }
+        self.store.register_empty(dir_id);
 
         // Increment parent nlink.
         self.graph.update_node(&parent_id, |n| {
@@ -490,25 +524,50 @@ impl Filesystem for AssFs {
             }
         };
 
+        // Capture node data for potential undo before removing anything.
+        let target_node_data = self
+            .graph
+            .get_node(&target_id)
+            .and_then(|n| bincode::serialize(&n).ok())
+            .unwrap_or_default();
         let old_hash = self.store.get_hash(&target_id);
 
-        // Log the removal.
-        if let Err(_) = txn_mgr.log_write(txn_id, target_id, old_hash, None) {
+        // Log edge removal.
+        if txn_mgr
+            .log_remove_edge(
+                txn_id,
+                parent_id,
+                target_id,
+                EdgeType::Child,
+                name_str.to_string(),
+            )
+            .is_err()
+        {
             let _ = txn_mgr.abort_txn(txn_id);
             reply.error(libc::EIO);
             return;
         }
 
-        // Remove edge.
-        self.graph.remove_edge(&parent_id, EdgeType::Child, name_str);
+        // Apply edge removal.
+        self.graph
+            .remove_edge(&parent_id, EdgeType::Child, name_str);
 
-        // Decrement nlink; if no more edges point to this node, remove it.
-        let should_remove = {
-            let reverse = self.graph.reverse_lookup(&target_id);
-            reverse.is_empty()
-        };
+        // Check if node should be removed (no more incoming edges).
+        let should_remove = self.graph.reverse_lookup(&target_id).is_empty();
 
         if should_remove {
+            // Log node and content removal.
+            if txn_mgr
+                .log_remove_node(txn_id, target_id, target_node_data)
+                .is_err()
+                || txn_mgr
+                    .log_content_change(txn_id, target_id, old_hash, None)
+                    .is_err()
+            {
+                let _ = txn_mgr.abort_txn(txn_id);
+                reply.error(libc::EIO);
+                return;
+            }
             self.graph.remove_node(&target_id);
             self.store.remove_object(&target_id);
             self.inodes.remove_id(&target_id);
@@ -577,13 +636,38 @@ impl Filesystem for AssFs {
             }
         };
 
-        if let Err(_) = txn_mgr.log_write(txn_id, target_id, Some(EMPTY_HASH), None) {
+        // Capture node data for undo before removing.
+        let target_node_data = self
+            .graph
+            .get_node(&target_id)
+            .and_then(|n| bincode::serialize(&n).ok())
+            .unwrap_or_default();
+
+        // Log edge removal, node removal, and content removal.
+        if txn_mgr
+            .log_remove_edge(
+                txn_id,
+                parent_id,
+                target_id,
+                EdgeType::Child,
+                name_str.to_string(),
+            )
+            .is_err()
+            || txn_mgr
+                .log_remove_node(txn_id, target_id, target_node_data)
+                .is_err()
+            || txn_mgr
+                .log_content_change(txn_id, target_id, Some(EMPTY_HASH), None)
+                .is_err()
+        {
             let _ = txn_mgr.abort_txn(txn_id);
             reply.error(libc::EIO);
             return;
         }
 
-        self.graph.remove_edge(&parent_id, EdgeType::Child, name_str);
+        // Apply to in-memory state.
+        self.graph
+            .remove_edge(&parent_id, EdgeType::Child, name_str);
         self.graph.remove_node(&target_id);
         self.store.remove_object(&target_id);
         self.inodes.remove_id(&target_id);
@@ -746,8 +830,8 @@ impl Filesystem for AssFs {
             }
         };
 
-        // Log the write.
-        if let Err(_) = txn_mgr.log_write(txn_id, obj_id, old_hash, Some(new_hash)) {
+        // Log the content change.
+        if let Err(_) = txn_mgr.log_content_change(txn_id, obj_id, old_hash, Some(new_hash)) {
             let _ = txn_mgr.abort_txn(txn_id);
             reply.error(libc::EIO);
             return;
@@ -831,7 +915,23 @@ impl Filesystem for AssFs {
             }
         };
 
-        // Add edge: this is the associative property — same object, new name.
+        // Log the edge addition — this is the associative property.
+        if txn_mgr
+            .log_add_edge(
+                txn_id,
+                parent_id,
+                target_id,
+                EdgeType::Child,
+                name_str.to_string(),
+            )
+            .is_err()
+        {
+            let _ = txn_mgr.abort_txn(txn_id);
+            reply.error(libc::EIO);
+            return;
+        }
+
+        // Apply to in-memory state.
         if let Err(_) = self.graph.add_edge(
             parent_id,
             target_id,
@@ -850,14 +950,6 @@ impl Filesystem for AssFs {
             n.metadata.ctime = sec;
             n.metadata.ctime_nsec = nsec;
         });
-
-        // Log the link operation.
-        let hash = self.store.get_hash(&target_id);
-        if let Err(_) = txn_mgr.log_write(txn_id, target_id, hash, hash) {
-            let _ = txn_mgr.abort_txn(txn_id);
-            reply.error(libc::EIO);
-            return;
-        }
 
         if let Err(_) = txn_mgr.commit_txn(txn_id) {
             reply.error(libc::EIO);
@@ -922,18 +1014,6 @@ impl Filesystem for AssFs {
             }
         };
 
-        // If destination exists, unlink it first.
-        if let Some(existing_id) = self.graph.resolve(&new_parent_id, EdgeType::Child, new_name) {
-            self.graph
-                .remove_edge(&new_parent_id, EdgeType::Child, new_name);
-            let reverse = self.graph.reverse_lookup(&existing_id);
-            if reverse.is_empty() {
-                self.graph.remove_node(&existing_id);
-                self.store.remove_object(&existing_id);
-                self.inodes.remove_id(&existing_id);
-            }
-        }
-
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
         let txn_id = match txn_mgr.start_txn() {
             Ok(id) => id,
@@ -943,7 +1023,80 @@ impl Filesystem for AssFs {
             }
         };
 
-        // Remove old edge, add new edge.
+        // If destination exists, remove it inside the transaction.
+        if let Some(existing_id) =
+            self.graph.resolve(&new_parent_id, EdgeType::Child, new_name)
+        {
+            let existing_node_data = self
+                .graph
+                .get_node(&existing_id)
+                .and_then(|n| bincode::serialize(&n).ok())
+                .unwrap_or_default();
+            let existing_hash = self.store.get_hash(&existing_id);
+
+            if txn_mgr
+                .log_remove_edge(
+                    txn_id,
+                    new_parent_id,
+                    existing_id,
+                    EdgeType::Child,
+                    new_name.to_string(),
+                )
+                .is_err()
+            {
+                let _ = txn_mgr.abort_txn(txn_id);
+                reply.error(libc::EIO);
+                return;
+            }
+
+            self.graph
+                .remove_edge(&new_parent_id, EdgeType::Child, new_name);
+
+            let should_remove = self.graph.reverse_lookup(&existing_id).is_empty();
+            if should_remove {
+                if txn_mgr
+                    .log_remove_node(txn_id, existing_id, existing_node_data)
+                    .is_err()
+                    || txn_mgr
+                        .log_content_change(txn_id, existing_id, existing_hash, None)
+                        .is_err()
+                {
+                    let _ = txn_mgr.abort_txn(txn_id);
+                    reply.error(libc::EIO);
+                    return;
+                }
+                self.graph.remove_node(&existing_id);
+                self.store.remove_object(&existing_id);
+                self.inodes.remove_id(&existing_id);
+            }
+        }
+
+        // Log old edge removal, new edge addition.
+        if txn_mgr
+            .log_remove_edge(
+                txn_id,
+                old_parent_id,
+                target_id,
+                EdgeType::Child,
+                old_name.to_string(),
+            )
+            .is_err()
+            || txn_mgr
+                .log_add_edge(
+                    txn_id,
+                    new_parent_id,
+                    target_id,
+                    EdgeType::Child,
+                    new_name.to_string(),
+                )
+                .is_err()
+        {
+            let _ = txn_mgr.abort_txn(txn_id);
+            reply.error(libc::EIO);
+            return;
+        }
+
+        // Apply to in-memory state.
         self.graph
             .remove_edge(&old_parent_id, EdgeType::Child, old_name);
         if let Err(_) = self.graph.add_edge(
@@ -957,7 +1110,7 @@ impl Filesystem for AssFs {
             return;
         }
 
-        // Update nlink if moving between directories.
+        // Update nlink if moving a directory between parents.
         if old_parent_id != new_parent_id {
             if let Some(node) = self.graph.get_node(&target_id) {
                 if node.node_type == NodeType::Directory {
@@ -969,13 +1122,6 @@ impl Filesystem for AssFs {
                     });
                 }
             }
-        }
-
-        let hash = self.store.get_hash(&target_id);
-        if let Err(_) = txn_mgr.log_write(txn_id, target_id, hash, hash) {
-            let _ = txn_mgr.abort_txn(txn_id);
-            reply.error(libc::EIO);
-            return;
         }
 
         if let Err(_) = txn_mgr.commit_txn(txn_id) {

@@ -1,12 +1,11 @@
 //! Log manager — sequential append log with sync writes.
 //!
-//! Log records are tuples: <operation, object_id, old_content_hash, new_content_hash>.
-//! Old hash = undo, new hash = redo.
+//! Every mutation (content change, graph node add/remove, graph edge
+//! add/remove) is logged with enough old/new state to undo and redo.
 //!
 //! Episode lesson (via Mike Young / Camelot): old+new value logging means
 //! metadata can be written before transaction commits — undo is the safety
-//! net, not a gate. Even sync writes here are simpler than Episode's async
-//! log + io_window (that's Phase 2).
+//! net, not a gate.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
@@ -14,12 +13,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ContentHash, LogSequenceNumber, ObjectId, TransactionId};
+use crate::{ContentHash, EdgeType, LogSequenceNumber, ObjectId, TransactionId};
 
 /// Types of log records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogRecordType {
-    /// Data modification record.
+    /// A mutation record (content or graph).
     Data,
     /// Transaction end (commit marker).
     End,
@@ -29,7 +28,47 @@ pub enum LogRecordType {
     Restart,
 }
 
-/// A single log record (tuple).
+/// The payload of a mutation record.
+///
+/// Each variant carries enough state to both redo (apply forward) and
+/// undo (revert). This is old/new value logging — not write-ahead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum LogPayload {
+    /// Content hash changed for an object.
+    ContentChange {
+        object_id: ObjectId,
+        old_hash: Option<ContentHash>,
+        new_hash: Option<ContentHash>,
+    },
+    /// Node added to the graph.
+    AddNode {
+        /// Serialized GraphNode (full state for undo = remove).
+        node_data: Vec<u8>,
+        node_id: ObjectId,
+    },
+    /// Node removed from the graph.
+    RemoveNode {
+        /// Serialized GraphNode (full state for undo = re-add).
+        node_data: Vec<u8>,
+        node_id: ObjectId,
+    },
+    /// Edge added to the graph.
+    AddEdge {
+        source: ObjectId,
+        target: ObjectId,
+        edge_type: EdgeType,
+        label: String,
+    },
+    /// Edge removed from the graph.
+    RemoveEdge {
+        source: ObjectId,
+        target: ObjectId,
+        edge_type: EdgeType,
+        label: String,
+    },
+}
+
+/// A single log record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRecord {
     /// Monotonically increasing sequence number.
@@ -38,12 +77,8 @@ pub struct LogRecord {
     pub record_type: LogRecordType,
     /// Transaction this record belongs to.
     pub transaction_id: TransactionId,
-    /// Object being modified (for Data records).
-    pub object_id: ObjectId,
-    /// Previous content hash (undo value).
-    pub old_hash: Option<ContentHash>,
-    /// New content hash (redo value).
-    pub new_hash: Option<ContentHash>,
+    /// Payload (only meaningful for Data records).
+    pub payload: Option<LogPayload>,
 }
 
 /// The log manager.
@@ -56,7 +91,6 @@ pub struct LogManager {
 impl LogManager {
     /// Open or create a log file.
     pub fn open(path: &Path) -> io::Result<Self> {
-        // Determine next LSN by scanning existing records.
         let next_lsn = if path.exists() {
             let records = Self::read_all_records(path)?;
             records.last().map_or(1, |r| r.lsn + 1)
@@ -77,21 +111,17 @@ impl LogManager {
         })
     }
 
-    /// Append a data record to the log.
+    /// Append a data record with the given payload.
     pub fn log_data(
         &mut self,
         txn_id: TransactionId,
-        object_id: ObjectId,
-        old_hash: Option<ContentHash>,
-        new_hash: Option<ContentHash>,
+        payload: LogPayload,
     ) -> io::Result<LogSequenceNumber> {
         self.append(LogRecord {
             lsn: self.next_lsn,
             record_type: LogRecordType::Data,
             transaction_id: txn_id,
-            object_id,
-            old_hash,
-            new_hash,
+            payload: Some(payload),
         })
     }
 
@@ -101,9 +131,7 @@ impl LogManager {
             lsn: self.next_lsn,
             record_type: LogRecordType::End,
             transaction_id: txn_id,
-            object_id: uuid::Uuid::nil(),
-            old_hash: None,
-            new_hash: None,
+            payload: None,
         })
     }
 
@@ -113,9 +141,7 @@ impl LogManager {
             lsn: self.next_lsn,
             record_type: LogRecordType::Checkpoint,
             transaction_id: 0,
-            object_id: uuid::Uuid::nil(),
-            old_hash: None,
-            new_hash: None,
+            payload: None,
         })
     }
 
@@ -125,9 +151,7 @@ impl LogManager {
             lsn: self.next_lsn,
             record_type: LogRecordType::Restart,
             transaction_id: 0,
-            object_id: uuid::Uuid::nil(),
-            old_hash: None,
-            new_hash: None,
+            payload: None,
         })
     }
 
@@ -173,7 +197,6 @@ impl LogManager {
             match reader.read_exact(&mut len_buf) {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // Partial write at end of log — truncated record, stop here.
                     log::warn!("Truncated record at log offset {}, ignoring", pos);
                     break;
                 }

@@ -74,7 +74,8 @@ implemented and tested through real FUSE mounts.
 
 **Test coverage:**
 - 8 unit tests (refcount, file backend)
-- 13 layer-integration tests (log, txn, recovery, graph, content store)
+- 18 layer-integration tests (log, txn, recovery, graph, content store,
+  graph recovery with committed/uncommitted/mixed scenarios)
 - 8 end-to-end FUSE tests (mount, create, read, write, mkdir, unlink, rmdir,
   hardlink, rename, readdir)
 

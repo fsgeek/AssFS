@@ -1,34 +1,36 @@
 //! Recovery engine — redo committed, undo uncommitted.
 //!
 //! On mount, scan the log to find committed vs uncommitted transactions.
-//! Redo committed: ensure object_id → new_content_hash in the index.
-//! Undo uncommitted: revert object_id → old_content_hash in the index.
+//! Redo committed: replay all operations (content changes AND graph mutations).
+//! Undo uncommitted: reverse all operations.
 //!
-//! Simpler than Episode: content blobs are never overwritten, only the
-//! object index (ObjectId → ContentHash mapping) needs fixing.
+//! Both the object index and the graph state are corrected.
 
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
+use crate::graph::node::GraphNode;
+use crate::graph::operations::GraphNamespace;
 use crate::store::content::ContentStore;
 use crate::TransactionId;
 
-use super::log::{LogManager, LogRecord, LogRecordType};
+use super::log::{LogManager, LogPayload, LogRecordType};
 
 /// Result of running recovery.
 #[derive(Debug)]
 pub struct RecoveryResult {
-    /// Number of committed transactions replayed.
     pub committed_count: usize,
-    /// Number of uncommitted transactions rolled back.
     pub uncommitted_count: usize,
-    /// Highest transaction ID seen (for TransactionManager restart).
     pub max_txn_id: TransactionId,
 }
 
 /// Run recovery: scan log, redo committed, undo uncommitted.
-pub fn recover(log_path: &Path, store: &ContentStore) -> io::Result<RecoveryResult> {
+pub fn recover(
+    log_path: &Path,
+    store: &ContentStore,
+    graph: &GraphNamespace,
+) -> io::Result<RecoveryResult> {
     let records = LogManager::read_all_records(log_path)?;
 
     if records.is_empty() {
@@ -57,10 +59,8 @@ pub fn recover(log_path: &Path, store: &ContentStore) -> io::Result<RecoveryResu
         }
     }
 
-    let uncommitted: HashSet<TransactionId> = all_txn_ids
-        .difference(&committed)
-        .copied()
-        .collect();
+    let uncommitted: HashSet<TransactionId> =
+        all_txn_ids.difference(&committed).copied().collect();
 
     log::info!(
         "Recovery: {} committed, {} uncommitted transactions",
@@ -68,9 +68,7 @@ pub fn recover(log_path: &Path, store: &ContentStore) -> io::Result<RecoveryResu
         uncommitted.len()
     );
 
-    // Phase 2: Redo committed transactions.
-    // For each committed txn, ensure the object index reflects new_hash.
-    // Process in LSN order so later writes win.
+    // Phase 2: Redo committed transactions (in LSN order).
     for record in &records {
         if record.record_type != LogRecordType::Data {
             continue;
@@ -78,40 +76,123 @@ pub fn recover(log_path: &Path, store: &ContentStore) -> io::Result<RecoveryResu
         if !committed.contains(&record.transaction_id) {
             continue;
         }
-        if let Some(new_hash) = record.new_hash {
-            store.set_hash(record.object_id, new_hash);
-        } else {
-            // new_hash is None → object was deleted by this txn.
-            store.remove_object(&record.object_id);
+        if let Some(ref payload) = record.payload {
+            redo_payload(payload, store, graph);
         }
     }
 
-    // Phase 3: Undo uncommitted transactions.
-    // For each uncommitted txn, revert the object index to old_hash.
-    // Process in reverse LSN order so we undo most recent first.
-    let mut uncommitted_records: Vec<&LogRecord> = records
+    // Phase 3: Undo uncommitted transactions (in reverse LSN order).
+    let mut uncommitted_records: Vec<_> = records
         .iter()
         .filter(|r| {
             r.record_type == LogRecordType::Data && uncommitted.contains(&r.transaction_id)
         })
         .collect();
-    uncommitted_records.sort_by(|a, b| b.lsn.cmp(&a.lsn)); // reverse LSN order
+    uncommitted_records.sort_by(|a, b| b.lsn.cmp(&a.lsn));
 
     for record in &uncommitted_records {
-        if let Some(old_hash) = record.old_hash {
-            store.set_hash(record.object_id, old_hash);
-        } else {
-            // old_hash is None → object didn't exist before this txn.
-            store.remove_object(&record.object_id);
+        if let Some(ref payload) = record.payload {
+            undo_payload(payload, store, graph);
         }
     }
 
-    // Phase 4: Flush the corrected index to disk.
+    // Phase 4: Flush corrected state.
     store.flush_index()?;
+    graph.flush()?;
 
     Ok(RecoveryResult {
         committed_count: committed.len(),
         uncommitted_count: uncommitted.len(),
         max_txn_id,
     })
+}
+
+/// Apply a payload forward (redo).
+fn redo_payload(payload: &LogPayload, store: &ContentStore, graph: &GraphNamespace) {
+    match payload {
+        LogPayload::ContentChange {
+            object_id,
+            new_hash,
+            ..
+        } => {
+            if let Some(hash) = new_hash {
+                store.set_hash(*object_id, *hash);
+            } else {
+                store.remove_object(object_id);
+            }
+        }
+        LogPayload::AddNode { node_data, node_id } => {
+            if let Ok(node) = bincode::deserialize::<GraphNode>(node_data) {
+                graph.add_node(node);
+            } else {
+                log::error!("Recovery: failed to deserialize AddNode for {}", node_id);
+            }
+        }
+        LogPayload::RemoveNode { node_id, .. } => {
+            graph.remove_node(node_id);
+        }
+        LogPayload::AddEdge {
+            source,
+            target,
+            edge_type,
+            label,
+        } => {
+            let _ = graph.add_edge(*source, *target, *edge_type, label.clone());
+        }
+        LogPayload::RemoveEdge {
+            source,
+            edge_type,
+            label,
+            ..
+        } => {
+            graph.remove_edge(source, *edge_type, label);
+        }
+    }
+}
+
+/// Reverse a payload (undo). Each operation is the inverse of redo.
+fn undo_payload(payload: &LogPayload, store: &ContentStore, graph: &GraphNamespace) {
+    match payload {
+        LogPayload::ContentChange {
+            object_id,
+            old_hash,
+            ..
+        } => {
+            if let Some(hash) = old_hash {
+                store.set_hash(*object_id, *hash);
+            } else {
+                store.remove_object(object_id);
+            }
+        }
+        // Undo AddNode = remove it.
+        LogPayload::AddNode { node_id, .. } => {
+            graph.remove_node(node_id);
+        }
+        // Undo RemoveNode = re-add it.
+        LogPayload::RemoveNode { node_data, node_id } => {
+            if let Ok(node) = bincode::deserialize::<GraphNode>(node_data) {
+                graph.add_node(node);
+            } else {
+                log::error!("Recovery: failed to deserialize RemoveNode for {}", node_id);
+            }
+        }
+        // Undo AddEdge = remove it.
+        LogPayload::AddEdge {
+            source,
+            edge_type,
+            label,
+            ..
+        } => {
+            graph.remove_edge(source, *edge_type, label);
+        }
+        // Undo RemoveEdge = re-add it.
+        LogPayload::RemoveEdge {
+            source,
+            target,
+            edge_type,
+            label,
+        } => {
+            let _ = graph.add_edge(*source, *target, *edge_type, label.clone());
+        }
+    }
 }
