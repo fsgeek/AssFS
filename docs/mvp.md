@@ -78,6 +78,9 @@ implemented and tested through real FUSE mounts.
   graph recovery with committed/uncommitted/mixed scenarios)
 - 8 end-to-end FUSE tests (mount, create, read, write, mkdir, unlink, rmdir,
   hardlink, rename, readdir)
+- 4 crash injection tests (SIGKILL during file creation, overwrite, directory
+  ops, repeated crash/recovery cycles — verifies committed data survives,
+  no partial state, filesystem remounts correctly)
 
 **Known limitations:**
 - Entire file content is read-modify-written on each write (no block-level COW).

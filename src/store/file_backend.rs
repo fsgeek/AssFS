@@ -25,7 +25,7 @@ impl FileBackend {
     }
 
     /// Path for a given content hash: root/ab/abcdef...
-    fn blob_path(&self, hash: &ContentHash) -> PathBuf {
+    pub fn blob_path(&self, hash: &ContentHash) -> PathBuf {
         let hex = hash_hex(hash);
         self.root.join(&hex[..2]).join(&hex)
     }

@@ -96,7 +96,30 @@ pub fn recover(
         }
     }
 
-    // Phase 4: Flush corrected state.
+    // Phase 4: Reconcile file sizes with actual blob sizes.
+    // Write operations update node metadata (size, mtime) in-memory but don't
+    // log these changes. After redo/undo, the graph node may have stale size
+    // from the original AddNode log record. Fix this by stat-ing each blob.
+    {
+        let file_node_ids: Vec<crate::ObjectId> = {
+            let state = graph.state.lock().unwrap();
+            state
+                .nodes
+                .iter()
+                .filter(|(_, n)| n.node_type == crate::NodeType::File)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for id in file_node_ids {
+            if let Ok(size) = store.get_content_size(&id) {
+                graph.update_node(&id, |node| {
+                    node.metadata.size = size;
+                });
+            }
+        }
+    }
+
+    // Phase 5: Flush corrected state.
     store.flush_index()?;
     graph.flush()?;
 
@@ -108,6 +131,13 @@ pub fn recover(
 }
 
 /// Apply a payload forward (redo).
+///
+/// Redo must be idempotent: the persisted graph/index state may already
+/// reflect this operation (from a prior flush). We guard AddNode and
+/// AddEdge with existence checks so replaying old log records doesn't
+/// stomp on more-recent persisted metadata (e.g., a node's size updated
+/// by a later write that only logged a ContentChange, not a full node
+/// snapshot). ContentChange and Remove* are naturally idempotent.
 fn redo_payload(payload: &LogPayload, store: &ContentStore, graph: &GraphNamespace) {
     match payload {
         LogPayload::ContentChange {
@@ -122,10 +152,15 @@ fn redo_payload(payload: &LogPayload, store: &ContentStore, graph: &GraphNamespa
             }
         }
         LogPayload::AddNode { node_data, node_id } => {
-            if let Ok(node) = bincode::deserialize::<GraphNode>(node_data) {
-                graph.add_node(node);
-            } else {
-                log::error!("Recovery: failed to deserialize AddNode for {}", node_id);
+            // Skip if node already exists — persisted state is at least as recent
+            // as this log record, and may have metadata updates (size, mtime) that
+            // the log record's creation-time snapshot doesn't capture.
+            if !graph.node_exists(node_id) {
+                if let Ok(node) = bincode::deserialize::<GraphNode>(node_data) {
+                    graph.add_node(node);
+                } else {
+                    log::error!("Recovery: failed to deserialize AddNode for {}", node_id);
+                }
             }
         }
         LogPayload::RemoveNode { node_id, .. } => {
@@ -137,7 +172,11 @@ fn redo_payload(payload: &LogPayload, store: &ContentStore, graph: &GraphNamespa
             edge_type,
             label,
         } => {
-            let _ = graph.add_edge(*source, *target, *edge_type, label.clone());
+            // Skip if edge already exists — avoids duplicate reverse-index entries
+            // and preserves any metadata updates the persisted state may have.
+            if graph.resolve(source, *edge_type, label).is_none() {
+                let _ = graph.add_edge(*source, *target, *edge_type, label.clone());
+            }
         }
         LogPayload::RemoveEdge {
             source,

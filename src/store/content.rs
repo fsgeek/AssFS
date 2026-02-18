@@ -104,6 +104,26 @@ impl ContentStore {
         idx.entries.insert(object_id, hash);
     }
 
+    /// Get the size of an object's content without reading the blob.
+    /// Used by recovery to reconcile node metadata.
+    pub fn get_content_size(&self, object_id: &ObjectId) -> io::Result<u64> {
+        let hash = {
+            let idx = self.index.lock().unwrap();
+            match idx.entries.get(object_id) {
+                Some(h) if *h == EMPTY_HASH => return Ok(0),
+                Some(h) => *h,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("object {} not in index", object_id),
+                    ))
+                }
+            }
+        };
+        let path = self.backend.blob_path(&hash);
+        Ok(std::fs::metadata(&path)?.len())
+    }
+
     /// Persist the object index to disk.
     pub fn flush_index(&self) -> io::Result<()> {
         let idx = self.index.lock().unwrap();
