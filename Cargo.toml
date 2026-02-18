@@ -1,0 +1,20 @@
+[package]
+name = "assfs"
+version = "0.1.0"
+edition = "2021"
+description = "Associative File System — graph namespace with transactional object store"
+
+[dependencies]
+fuser = "0.14"
+blake3 = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+libc = "0.2"
+log = "0.4"
+env_logger = "0.10"
+parking_lot = "0.12"
+byteorder = "1"
+
+[dev-dependencies]
+tempfile = "3"
