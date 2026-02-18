@@ -4,7 +4,6 @@
 //! (actual syscalls, not mocked), and verifies the filesystem works.
 
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -55,7 +54,7 @@ fn unmount(mountpoint: &std::path::Path) {
 
 struct MountGuard {
     mountpoint: PathBuf,
-    data_dir: tempfile::TempDir,
+    _data_dir: tempfile::TempDir, // held to keep tempdir alive
     child: Option<std::process::Child>,
 }
 
@@ -82,7 +81,7 @@ impl MountGuard {
 
         let mut guard = MountGuard {
             mountpoint: mountpoint.clone(),
-            data_dir,
+            _data_dir: data_dir,
             child: Some(child),
         };
 
