@@ -91,4 +91,14 @@ impl GraphNode {
             metadata: NodeMetadata::new_file(uid, gid, mode),
         }
     }
+
+    /// Create a tag anchor node — pure graph node, not in any directory.
+    pub fn new_tag_anchor(id: ObjectId) -> Self {
+        Self {
+            id,
+            node_type: NodeType::TagAnchor,
+            content_hash: EMPTY_HASH,
+            metadata: NodeMetadata::new_file(0, 0, 0),
+        }
+    }
 }

@@ -10,10 +10,33 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{ContentHash, EdgeType, LogSequenceNumber, ObjectId, TransactionId};
+
+/// Log-level timing counters. Shared with FsStats via Arc or direct access.
+pub struct LogTimings {
+    pub serialize_ns: AtomicU64,
+    pub write_ns: AtomicU64,
+    pub sync_ns: AtomicU64,
+    pub record_count: AtomicU64,
+    pub record_bytes: AtomicU64,
+}
+
+impl LogTimings {
+    pub fn new() -> Self {
+        Self {
+            serialize_ns: AtomicU64::new(0),
+            write_ns: AtomicU64::new(0),
+            sync_ns: AtomicU64::new(0),
+            record_count: AtomicU64::new(0),
+            record_bytes: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Types of log records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +109,9 @@ pub struct LogManager {
     log_path: PathBuf,
     writer: BufWriter<File>,
     next_lsn: LogSequenceNumber,
+    pub timings: LogTimings,
+    /// When true, skip fsync on every record (unsafe, for measurement only).
+    pub no_sync: bool,
 }
 
 impl LogManager {
@@ -108,6 +134,8 @@ impl LogManager {
             log_path: path.to_path_buf(),
             writer,
             next_lsn,
+            timings: LogTimings::new(),
+            no_sync: false,
         })
     }
 
@@ -158,18 +186,31 @@ impl LogManager {
     /// Append a record, sync to disk, return its LSN.
     fn append(&mut self, record: LogRecord) -> io::Result<LogSequenceNumber> {
         let lsn = record.lsn;
+        let r = Ordering::Relaxed;
 
+        // Phase 1: Serialize.
+        let t0 = Instant::now();
         let record_bytes =
             bincode::serialize(&record).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let len = record_bytes.len() as u32;
+        self.timings.serialize_ns.fetch_add(t0.elapsed().as_nanos() as u64, r);
 
-        // Write length prefix + record data.
+        // Phase 2: Write to buffer + flush.
+        let t1 = Instant::now();
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&record_bytes)?;
         self.writer.flush()?;
+        self.timings.write_ns.fetch_add(t1.elapsed().as_nanos() as u64, r);
 
-        // Sync to stable storage (this is the commit point for End records).
-        self.writer.get_ref().sync_all()?;
+        // Phase 3: Sync to stable storage (commit point for End records).
+        let t2 = Instant::now();
+        if !self.no_sync {
+            self.writer.get_ref().sync_all()?;
+        }
+        self.timings.sync_ns.fetch_add(t2.elapsed().as_nanos() as u64, r);
+
+        self.timings.record_count.fetch_add(1, r);
+        self.timings.record_bytes.fetch_add(record_bytes.len() as u64, r);
 
         self.next_lsn += 1;
         Ok(lsn)

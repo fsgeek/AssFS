@@ -10,10 +10,12 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <mountpoint> [--data-dir <path>]", args[0]);
+        eprintln!("Usage: {} <mountpoint> [--data-dir <path>] [--stats-file <path>]", args[0]);
         eprintln!();
         eprintln!("  <mountpoint>          Where to mount the filesystem");
         eprintln!("  --data-dir <path>     Where to store data (default: ~/.assfs)");
+        eprintln!("  --stats-file <path>   Write JSON stats on unmount");
+        eprintln!("  --no-sync             Skip fsync (UNSAFE, for measurement only)");
         std::process::exit(1);
     }
 
@@ -31,6 +33,18 @@ fn main() {
         dirs_or_default()
     };
 
+    // Parse --stats-file option.
+    let stats_file = if let Some(pos) = args.iter().position(|a| a == "--stats-file") {
+        if pos + 1 < args.len() {
+            Some(PathBuf::from(&args[pos + 1]))
+        } else {
+            eprintln!("--stats-file requires a path argument");
+            std::process::exit(1);
+        }
+    } else {
+        None
+    };
+
     log::info!("AssFS starting");
     log::info!("  mountpoint: {}", mountpoint.display());
     log::info!("  data dir:   {}", data_dir.display());
@@ -43,13 +57,17 @@ fn main() {
         }
     }
 
-    let fs = match AssFs::open(&data_dir) {
+    let mut fs = match AssFs::open(&data_dir) {
         Ok(fs) => fs,
         Err(e) => {
             eprintln!("Failed to open AssFS: {}", e);
             std::process::exit(1);
         }
     };
+    fs.stats_file = stats_file.clone();
+    if args.iter().any(|a| a == "--no-sync") {
+        fs.set_no_sync(true);
+    }
 
     let options = vec![
         MountOption::AutoUnmount,
@@ -67,11 +85,12 @@ fn main() {
             MountOption::FSName("assfs".to_string()),
             MountOption::DefaultPermissions,
         ];
-        if let Err(e) = fuser::mount2(
-            AssFs::open(&data_dir).expect("reopen failed"),
-            &mountpoint,
-            &options,
-        ) {
+        let mut fs2 = AssFs::open(&data_dir).expect("reopen failed");
+        fs2.stats_file = stats_file;
+        if args.iter().any(|a| a == "--no-sync") {
+            fs2.set_no_sync(true);
+        }
+        if let Err(e) = fuser::mount2(fs2, &mountpoint, &options) {
             eprintln!("Failed to mount: {}", e);
             std::process::exit(1);
         }

@@ -10,16 +10,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 
 use crate::graph::node::{GraphNode, NodeMetadata};
 use crate::graph::operations::GraphNamespace;
 use crate::projection::{InodeTable, Ino};
+use crate::stats::FsStats;
 use crate::store::content::ContentStore;
 use crate::txn::recovery;
 use crate::txn::transaction::TransactionManager;
 use crate::{EdgeType, NodeType, ObjectId, EMPTY_HASH};
+
+use std::sync::atomic::Ordering::Relaxed;
 
 const TTL: Duration = Duration::from_secs(1);
 const BLOCK_SIZE: u32 = 4096;
@@ -31,6 +34,11 @@ pub struct AssFs {
     pub txn_mgr: std::sync::Mutex<TransactionManager>,
     pub inodes: InodeTable,
     pub root_id: ObjectId,
+    /// Tag registry node — edges to all tag anchor nodes.
+    pub tag_registry_id: ObjectId,
+    pub stats: FsStats,
+    pub stats_file: Option<PathBuf>,
+    pub no_sync: bool,
     #[allow(dead_code)]
     data_dir: PathBuf,
 }
@@ -81,14 +89,53 @@ impl AssFs {
 
         inodes.set_root(root_id);
 
+        // Tag registry — a pure graph node that indexes all tag anchors.
+        let tag_reg_path = data_dir.join("tag_registry_id");
+        let tag_registry_id = if tag_reg_path.exists() {
+            let bytes = std::fs::read(&tag_reg_path)?;
+            let id: ObjectId = bincode::deserialize(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if graph.node_exists(&id) {
+                id
+            } else {
+                let id = uuid::Uuid::new_v4();
+                graph.add_node(crate::graph::node::GraphNode::new_tag_anchor(id));
+                let bytes = bincode::serialize(&id)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                std::fs::write(&tag_reg_path, &bytes)?;
+                id
+            }
+        } else {
+            let id = uuid::Uuid::new_v4();
+            graph.add_node(crate::graph::node::GraphNode::new_tag_anchor(id));
+            let bytes =
+                bincode::serialize(&id).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            std::fs::write(&tag_reg_path, &bytes)?;
+            id
+        };
+
         Ok(Self {
             graph,
             store,
             txn_mgr: std::sync::Mutex::new(txn_mgr),
             inodes,
             root_id,
+            tag_registry_id,
+            stats: FsStats::new(),
+            stats_file: None,
+            no_sync: false,
             data_dir: data_dir.to_path_buf(),
         })
+    }
+
+    /// Enable no-sync mode on the log manager (unsafe, for measurement only).
+    pub fn set_no_sync(&mut self, no_sync: bool) {
+        self.no_sync = no_sync;
+        if no_sync {
+            let mut txn_mgr = self.txn_mgr.lock().unwrap();
+            txn_mgr.log.no_sync = true;
+            log::warn!("AssFS: --no-sync enabled. Crash recovery is UNSAFE.");
+        }
     }
 
     /// Flush all state to disk.
@@ -105,6 +152,7 @@ impl AssFs {
             NodeType::File => FileType::RegularFile,
             NodeType::Directory => FileType::Directory,
             NodeType::Symlink => FileType::Symlink,
+            NodeType::TagAnchor => FileType::RegularFile, // not reachable via POSIX tree
         };
 
         FileAttr {
@@ -143,6 +191,7 @@ fn system_time(sec: i64, nsec: u32) -> SystemTime {
 
 impl Filesystem for AssFs {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let _t = self.stats.lookup.enter();
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -178,6 +227,7 @@ impl Filesystem for AssFs {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        let _t = self.stats.getattr.enter();
         match self.get_node_by_ino(ino) {
             Some(node) => {
                 let attr = self.node_to_attr(&node);
@@ -205,6 +255,7 @@ impl Filesystem for AssFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let _t = self.stats.setattr.enter();
         let obj_id = match self.inodes.lookup_ino(ino) {
             Some(id) => id,
             None => {
@@ -299,6 +350,7 @@ impl Filesystem for AssFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let _t = self.stats.create.enter();
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -328,7 +380,10 @@ impl Filesystem for AssFs {
         // Start transaction.
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
         let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => id,
+            Ok(id) => {
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                id
+            }
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
@@ -381,6 +436,7 @@ impl Filesystem for AssFs {
             reply.error(libc::EIO);
             return;
         }
+        self.stats.txn_committed.fetch_add(1, Relaxed);
 
         let attr = self.node_to_attr(&file_node);
         reply.created(&TTL, &attr, 0, 0, 0);
@@ -395,6 +451,7 @@ impl Filesystem for AssFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let _t = self.stats.mkdir.enter();
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -422,7 +479,10 @@ impl Filesystem for AssFs {
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
         let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => id,
+            Ok(id) => {
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                id
+            }
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
@@ -476,12 +536,14 @@ impl Filesystem for AssFs {
             reply.error(libc::EIO);
             return;
         }
+        self.stats.txn_committed.fetch_add(1, Relaxed);
 
         let attr = self.node_to_attr(&dir_node);
         reply.entry(&TTL, &attr, 0);
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _t = self.stats.unlink.enter();
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -517,7 +579,10 @@ impl Filesystem for AssFs {
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
         let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => id,
+            Ok(id) => {
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                id
+            }
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
@@ -581,11 +646,13 @@ impl Filesystem for AssFs {
             reply.error(libc::EIO);
             return;
         }
+        self.stats.txn_committed.fetch_add(1, Relaxed);
 
         reply.ok();
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _t = self.stats.rmdir.enter();
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -629,7 +696,10 @@ impl Filesystem for AssFs {
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
         let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => id,
+            Ok(id) => {
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                id
+            }
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
@@ -681,6 +751,7 @@ impl Filesystem for AssFs {
             reply.error(libc::EIO);
             return;
         }
+        self.stats.txn_committed.fetch_add(1, Relaxed);
 
         reply.ok();
     }
@@ -693,6 +764,7 @@ impl Filesystem for AssFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        let _t = self.stats.readdir.enter();
         let node_id = match self.inodes.lookup_ino(ino) {
             Some(id) => id,
             None => {
@@ -716,15 +788,19 @@ impl Filesystem for AssFs {
         };
         entries.push((parent_ino, FileType::Directory, "..".to_string()));
 
-        // Children.
+        // Children — only show Child and Hardlink edges in POSIX readdir.
         let neighbors = self.graph.neighbors(&node_id);
-        for (_edge_type, label, target_id) in neighbors {
+        for (edge_type, label, target_id) in neighbors {
+            if edge_type != EdgeType::Child && edge_type != EdgeType::Hardlink {
+                continue;
+            }
             if let Some(target_node) = self.graph.get_node(&target_id) {
                 let target_ino = self.inodes.get_or_assign(target_id);
                 let ft = match target_node.node_type {
                     NodeType::File => FileType::RegularFile,
                     NodeType::Directory => FileType::Directory,
                     NodeType::Symlink => FileType::Symlink,
+                    NodeType::TagAnchor => continue, // not visible in POSIX tree
                 };
                 entries.push((target_ino, ft, label));
             }
@@ -751,6 +827,7 @@ impl Filesystem for AssFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let _t = self.stats.read.enter();
         let obj_id = match self.inodes.lookup_ino(ino) {
             Some(id) => id,
             None => {
@@ -766,11 +843,11 @@ impl Filesystem for AssFs {
                     reply.data(&[]);
                 } else {
                     let end = std::cmp::min(offset + size as usize, data.len());
+                    self.stats.read_bytes.fetch_add((end - offset) as u64, Relaxed);
                     reply.data(&data[offset..end]);
                 }
             }
             Err(_) => {
-                // No content yet (empty file).
                 reply.data(&[]);
             }
         }
@@ -788,6 +865,8 @@ impl Filesystem for AssFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        let _t = self.stats.write.enter();
+        self.stats.write_bytes.fetch_add(data.len() as u64, Relaxed);
         let obj_id = match self.inodes.lookup_ino(ino) {
             Some(id) => id,
             None => {
@@ -813,7 +892,10 @@ impl Filesystem for AssFs {
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
         let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => id,
+            Ok(id) => {
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                id
+            }
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
@@ -852,6 +934,7 @@ impl Filesystem for AssFs {
             reply.error(libc::EIO);
             return;
         }
+        self.stats.txn_committed.fetch_add(1, Relaxed);
 
         reply.written(data.len() as u32);
     }
@@ -864,6 +947,7 @@ impl Filesystem for AssFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        let _t = self.stats.link.enter();
         let name_str = match newname.to_str() {
             Some(n) => n,
             None => {
@@ -908,7 +992,10 @@ impl Filesystem for AssFs {
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
         let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => id,
+            Ok(id) => {
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                id
+            }
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
@@ -955,6 +1042,7 @@ impl Filesystem for AssFs {
             reply.error(libc::EIO);
             return;
         }
+        self.stats.txn_committed.fetch_add(1, Relaxed);
 
         match self.graph.get_node(&target_id) {
             Some(node) => {
@@ -975,6 +1063,7 @@ impl Filesystem for AssFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
+        let _t = self.stats.rename.enter();
         let old_name = match name.to_str() {
             Some(n) => n,
             None => {
@@ -1016,7 +1105,10 @@ impl Filesystem for AssFs {
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
         let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => id,
+            Ok(id) => {
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                id
+            }
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
@@ -1128,12 +1220,13 @@ impl Filesystem for AssFs {
             reply.error(libc::EIO);
             return;
         }
+        self.stats.txn_committed.fetch_add(1, Relaxed);
 
         reply.ok();
     }
 
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        // Verify the inode exists.
+        self.stats.open.count.fetch_add(1, Relaxed);
         if self.inodes.lookup_ino(ino).is_some() {
             reply.opened(0, 0);
         } else {
@@ -1167,10 +1260,363 @@ impl Filesystem for AssFs {
         );
     }
 
+    /// Set an extended attribute — the gateway to graph edge creation.
+    ///
+    /// Supported namespaces:
+    ///   user.assfs.tag.<name>  — tag this object (creates graph edge)
+    fn setxattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        name: &OsStr,
+        _value: &[u8],
+        flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let _t = self.stats.setxattr.enter();
+
+        let name_str = match name.to_str() {
+            Some(n) => n,
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        // Parse the assfs tag namespace.
+        let tag_name = match name_str.strip_prefix("user.assfs.tag.") {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                reply.error(libc::ENOTSUP);
+                return;
+            }
+        };
+
+        let obj_id = match self.inodes.lookup_ino(ino) {
+            Some(id) => id,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Check if this object already has this tag.
+        let already_tagged = self
+            .graph
+            .resolve(&obj_id, EdgeType::Tag, tag_name)
+            .is_some();
+
+        // Honor XATTR_CREATE / XATTR_REPLACE flags.
+        if flags & 0x1 != 0 && already_tagged {
+            // XATTR_CREATE: fail if exists
+            reply.error(libc::EEXIST);
+            return;
+        }
+        if flags & 0x2 != 0 && !already_tagged {
+            // XATTR_REPLACE: fail if not exists
+            reply.error(libc::ENODATA);
+            return;
+        }
+        if already_tagged {
+            reply.ok();
+            return;
+        }
+
+        let mut txn_mgr = self.txn_mgr.lock().unwrap();
+        let txn_id = match txn_mgr.start_txn() {
+            Ok(id) => {
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                id
+            }
+            Err(_) => {
+                reply.error(libc::ENOSPC);
+                return;
+            }
+        };
+
+        // Find or create the tag anchor node.
+        let anchor_id = if let Some(id) =
+            self.graph
+                .resolve(&self.tag_registry_id, EdgeType::Tag, tag_name)
+        {
+            id
+        } else {
+            // New tag — create anchor node and register it.
+            let id = uuid::Uuid::new_v4();
+            let node = GraphNode::new_tag_anchor(id);
+            let node_data = bincode::serialize(&node).unwrap_or_default();
+
+            if txn_mgr.log_add_node(txn_id, id, node_data).is_err()
+                || txn_mgr
+                    .log_add_edge(
+                        txn_id,
+                        self.tag_registry_id,
+                        id,
+                        EdgeType::Tag,
+                        tag_name.to_string(),
+                    )
+                    .is_err()
+            {
+                let _ = txn_mgr.abort_txn(txn_id);
+                reply.error(libc::EIO);
+                return;
+            }
+
+            self.graph.add_node(node);
+            if self
+                .graph
+                .add_edge(
+                    self.tag_registry_id,
+                    id,
+                    EdgeType::Tag,
+                    tag_name.to_string(),
+                )
+                .is_err()
+            {
+                let _ = txn_mgr.abort_txn(txn_id);
+                reply.error(libc::EIO);
+                return;
+            }
+
+            id
+        };
+
+        // Add Tag edge from object → tag anchor.
+        if txn_mgr
+            .log_add_edge(
+                txn_id,
+                obj_id,
+                anchor_id,
+                EdgeType::Tag,
+                tag_name.to_string(),
+            )
+            .is_err()
+        {
+            let _ = txn_mgr.abort_txn(txn_id);
+            reply.error(libc::EIO);
+            return;
+        }
+
+        if self
+            .graph
+            .add_edge(obj_id, anchor_id, EdgeType::Tag, tag_name.to_string())
+            .is_err()
+        {
+            let _ = txn_mgr.abort_txn(txn_id);
+            reply.error(libc::EIO);
+            return;
+        }
+
+        if txn_mgr.commit_txn(txn_id).is_err() {
+            reply.error(libc::EIO);
+            return;
+        }
+        self.stats.txn_committed.fetch_add(1, Relaxed);
+
+        log::debug!("Tagged ino {} with '{}'", ino, tag_name);
+        reply.ok();
+    }
+
+    /// Get an extended attribute.
+    ///
+    /// Supported names:
+    ///   user.assfs.tag.<name>  — empty if tagged, ENODATA if not
+    ///   user.assfs.id          — object UUID as string
+    ///   user.assfs.refs        — incoming references (the backpointer!)
+    fn getxattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        let _t = self.stats.getxattr.enter();
+
+        let name_str = match name.to_str() {
+            Some(n) => n,
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let obj_id = match self.inodes.lookup_ino(ino) {
+            Some(id) => id,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let value: Vec<u8> = if let Some(tag_name) = name_str.strip_prefix("user.assfs.tag.") {
+            if self
+                .graph
+                .resolve(&obj_id, EdgeType::Tag, tag_name)
+                .is_some()
+            {
+                Vec::new() // tag exists, value is empty (boolean tag)
+            } else {
+                reply.error(libc::ENODATA);
+                return;
+            }
+        } else if name_str == "user.assfs.id" {
+            obj_id.to_string().into_bytes()
+        } else if name_str == "user.assfs.refs" {
+            // The backpointer: who references this object?
+            let refs = self.graph.reverse_lookup(&obj_id);
+            let mut lines = Vec::new();
+            for (source_id, edge_type, label) in &refs {
+                lines.push(format!("{:?}:{}:{}", edge_type, source_id, label));
+            }
+            lines.join("\n").into_bytes()
+        } else {
+            reply.error(libc::ENODATA);
+            return;
+        };
+
+        if size == 0 {
+            reply.size(value.len() as u32);
+        } else if value.len() <= size as usize {
+            reply.data(&value);
+        } else {
+            reply.error(libc::ERANGE);
+        }
+    }
+
+    /// List extended attribute names.
+    fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
+        let _t = self.stats.listxattr.enter();
+
+        let obj_id = match self.inodes.lookup_ino(ino) {
+            Some(id) => id,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let mut names: Vec<String> = Vec::new();
+
+        // Built-in graph attributes (always present).
+        names.push("user.assfs.id".to_string());
+        names.push("user.assfs.refs".to_string());
+
+        // Tag edges — outgoing edges of type Tag.
+        let neighbors = self.graph.neighbors(&obj_id);
+        for (edge_type, label, _target) in &neighbors {
+            if *edge_type == EdgeType::Tag {
+                names.push(format!("user.assfs.tag.{}", label));
+            }
+        }
+
+        // Format as null-separated list with trailing null.
+        let mut data = Vec::new();
+        for name in &names {
+            data.extend_from_slice(name.as_bytes());
+            data.push(0);
+        }
+
+        if size == 0 {
+            reply.size(data.len() as u32);
+        } else if data.len() <= size as usize {
+            reply.data(&data);
+        } else {
+            reply.error(libc::ERANGE);
+        }
+    }
+
+    /// Remove an extended attribute — removes a tag edge.
+    fn removexattr(&mut self, _req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _t = self.stats.removexattr.enter();
+
+        let name_str = match name.to_str() {
+            Some(n) => n,
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let tag_name = match name_str.strip_prefix("user.assfs.tag.") {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                // Can't remove built-in attrs.
+                reply.error(libc::ENOTSUP);
+                return;
+            }
+        };
+
+        let obj_id = match self.inodes.lookup_ino(ino) {
+            Some(id) => id,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Verify the tag edge exists.
+        let anchor_id = match self.graph.resolve(&obj_id, EdgeType::Tag, tag_name) {
+            Some(id) => id,
+            None => {
+                reply.error(libc::ENODATA);
+                return;
+            }
+        };
+
+        let mut txn_mgr = self.txn_mgr.lock().unwrap();
+        let txn_id = match txn_mgr.start_txn() {
+            Ok(id) => {
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                id
+            }
+            Err(_) => {
+                reply.error(libc::ENOSPC);
+                return;
+            }
+        };
+
+        if txn_mgr
+            .log_remove_edge(
+                txn_id,
+                obj_id,
+                anchor_id,
+                EdgeType::Tag,
+                tag_name.to_string(),
+            )
+            .is_err()
+        {
+            let _ = txn_mgr.abort_txn(txn_id);
+            reply.error(libc::EIO);
+            return;
+        }
+
+        self.graph.remove_edge(&obj_id, EdgeType::Tag, tag_name);
+
+        if txn_mgr.commit_txn(txn_id).is_err() {
+            reply.error(libc::EIO);
+            return;
+        }
+        self.stats.txn_committed.fetch_add(1, Relaxed);
+
+        log::debug!("Untagged ino {} from '{}'", ino, tag_name);
+        reply.ok();
+    }
+
     fn destroy(&mut self) {
         log::info!("AssFS: unmounting, flushing state...");
         if let Err(e) = self.flush_all() {
             log::error!("Error flushing state on unmount: {}", e);
+        }
+        {
+            let txn_mgr = self.txn_mgr.lock().unwrap();
+            self.stats.print_summary(Some(&txn_mgr.log.timings));
+            if let Some(ref path) = self.stats_file {
+                if let Err(e) = self.stats.write_json(path, Some(&txn_mgr.log.timings)) {
+                    log::error!("Error writing stats file: {}", e);
+                }
+            }
         }
     }
 }

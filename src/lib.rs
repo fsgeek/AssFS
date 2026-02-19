@@ -2,6 +2,7 @@ pub mod fuse_ops;
 pub mod graph;
 pub mod projection;
 pub mod refcount;
+pub mod stats;
 pub mod store;
 pub mod txn;
 
@@ -38,6 +39,8 @@ pub enum NodeType {
     File,
     Directory,
     Symlink,
+    /// A tag anchor — pure graph node, not visible in the POSIX tree.
+    TagAnchor,
 }
 
 /// Edge types in the graph namespace.
@@ -49,4 +52,6 @@ pub enum EdgeType {
     Symlink,
     /// Hard link (additional name for same object)
     Hardlink,
+    /// Tag association (file → tag anchor, or registry → tag anchor)
+    Tag,
 }

@@ -74,8 +74,21 @@ impl GraphNamespace {
     }
 
     /// Remove a node from the graph.
+    /// Also cleans up reverse index entries for any outgoing edges
+    /// (e.g., tag edges from a file being deleted).
     pub fn remove_node(&self, id: &ObjectId) -> Option<GraphNode> {
         let mut state = self.state.lock().unwrap();
+        // Collect targets of outgoing edges, then clean up their reverse indices.
+        let targets: Vec<ObjectId> = state
+            .edges
+            .get(id)
+            .map(|idx| idx.outgoing.values().copied().collect())
+            .unwrap_or_default();
+        for target in &targets {
+            if let Some(rev) = state.reverse.get_mut(target) {
+                rev.retain(|(s, _, _)| s != id);
+            }
+        }
         state.edges.remove(id);
         state.reverse.remove(id);
         state.nodes.remove(id)
