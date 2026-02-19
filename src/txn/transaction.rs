@@ -18,6 +18,8 @@ use super::reservation::{AdmissionController, Reservation, MAX_TRANSACTION_SIZE}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionStatus {
     Active,
+    /// Transaction has finished its work but is waiting for EC commit.
+    Pending,
     Committed,
     Aborted,
 }
@@ -62,6 +64,13 @@ pub struct Transaction {
     pub undo_log: Vec<UndoEntry>,
     /// NO-STEAL: content data buffered until commit.
     pub pending_writes: Vec<(ObjectId, Vec<u8>)>,
+    // --- EC merge fields ---
+    /// Points to EC head transaction ID. Self if this is the head.
+    pub ec_head: TransactionId,
+    /// Number of active members in this EC (only meaningful on head).
+    pub ec_size: u32,
+    /// Member list (only on head). Does NOT include the head itself.
+    pub ec_members: Vec<TransactionId>,
 }
 
 /// The transaction manager.
@@ -113,6 +122,9 @@ impl TransactionManager {
             last_lsn: None,
             undo_log: Vec::new(),
             pending_writes: Vec::new(),
+            ec_head: id,
+            ec_size: 1,
+            ec_members: Vec::new(),
         };
 
         self.active.insert(id, txn);
@@ -296,6 +308,142 @@ impl TransactionManager {
     /// Check if any transactions are active.
     pub fn has_active_transactions(&self) -> bool {
         !self.active.is_empty()
+    }
+
+    // --- EC merge ---
+
+    /// Walk the ec_head chain to find the actual head of the equivalence class.
+    pub fn find_ec_head(&self, txn_id: TransactionId) -> TransactionId {
+        let mut current = txn_id;
+        loop {
+            match self.active.get(&current) {
+                Some(txn) if txn.ec_head == current => return current,
+                Some(txn) => current = txn.ec_head,
+                None => return txn_id, // transaction already committed
+            }
+        }
+    }
+
+    /// Merge two transactions into one equivalence class.
+    /// Follows Episode's algorithm: fold smaller EC into larger.
+    pub fn ec_merge(&mut self, txn1: TransactionId, txn2: TransactionId) {
+        if txn1 == txn2 {
+            return;
+        }
+
+        // Find EC heads (walk chain).
+        let head1 = self.find_ec_head(txn1);
+        let head2 = self.find_ec_head(txn2);
+        if head1 == head2 {
+            return; // already in same EC
+        }
+
+        // Verify both are still active.
+        let size1 = self.active.get(&head1).map_or(0, |t| t.ec_size);
+        let size2 = self.active.get(&head2).map_or(0, |t| t.ec_size);
+        if size1 == 0 || size2 == 0 {
+            return; // already committed
+        }
+
+        // Fold smaller into larger.
+        let (small_head, large_head) = if size1 <= size2 {
+            (head1, head2)
+        } else {
+            (head2, head1)
+        };
+
+        // Move members from small to large.
+        let small_members: Vec<TransactionId> = {
+            let small = self.active.get_mut(&small_head).unwrap();
+            small.ec_head = large_head;
+            let members = std::mem::take(&mut small.ec_members);
+            small.ec_size = 0;
+            members
+        };
+
+        // Redirect all small EC members to point to large head.
+        for &member_id in &small_members {
+            if let Some(member) = self.active.get_mut(&member_id) {
+                member.ec_head = large_head;
+            }
+        }
+
+        // Add small head + its members to large EC.
+        let large = self.active.get_mut(&large_head).unwrap();
+        large.ec_size += if small_members.is_empty() {
+            1
+        } else {
+            small_members.len() as u32 + 1
+        };
+        large.ec_members.push(small_head);
+        large.ec_members.extend(small_members);
+
+        log::debug!(
+            "EC merge: txn {} + txn {} -> head {} (size {})",
+            txn1,
+            txn2,
+            large_head,
+            large.ec_size
+        );
+    }
+
+    /// End a transaction. If this is the last member of its EC,
+    /// triggers the atomic commit (BEND for members, END for head).
+    /// Returns the pending_writes from ALL transactions in the EC.
+    pub fn end_txn(&mut self, txn_id: TransactionId) -> io::Result<Vec<(ObjectId, Vec<u8>)>> {
+        let head_id = self.find_ec_head(txn_id);
+
+        // Decrement EC size on the head.
+        let ec_size = {
+            let head = self.active.get_mut(&head_id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "EC head not found")
+            })?;
+            head.ec_size -= 1;
+            head.ec_size
+        };
+
+        if ec_size > 0 {
+            // Not the last member. Mark as pending, don't commit yet.
+            let txn = self.active.get_mut(&txn_id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "txn not found")
+            })?;
+            txn.status = TransactionStatus::Pending;
+            return Ok(Vec::new()); // No pending_writes returned until EC commits
+        }
+
+        // Last member -- commit the entire EC atomically.
+        let head = self.active.get(&head_id).unwrap();
+        let member_ids: Vec<TransactionId> = head.ec_members.clone();
+
+        // Collect all pending_writes from all EC members.
+        let mut all_pending = Vec::new();
+
+        // Write BEND for each non-head member.
+        for &member_id in &member_ids {
+            self.log.log_batch_end(member_id, head_id)?;
+            if let Some(member) = self.active.get_mut(&member_id) {
+                all_pending.extend(std::mem::take(&mut member.pending_writes));
+                member.status = TransactionStatus::Committed;
+                self.admission.release(&member.reservation);
+            }
+        }
+
+        // Write END for the head.
+        self.log.log_end(head_id)?;
+
+        // Mark head as committed, collect its pending_writes.
+        let head = self.active.get_mut(&head_id).unwrap();
+        all_pending.extend(std::mem::take(&mut head.pending_writes));
+        head.status = TransactionStatus::Committed;
+        self.admission.release(&head.reservation);
+
+        // Remove all EC members from active set.
+        for &member_id in &member_ids {
+            self.active.remove(&member_id);
+        }
+        self.active.remove(&head_id);
+
+        Ok(all_pending)
     }
 
     // --- Internal ---

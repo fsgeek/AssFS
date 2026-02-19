@@ -4,7 +4,8 @@ use std::io;
 
 use assfs::txn::log::{LogManager, LogPayload, LogRecordType};
 use assfs::txn::recovery;
-use assfs::txn::transaction::{TransactionManager, UndoEntry};
+use assfs::txn::tlock::TlockTable;
+use assfs::txn::transaction::{TransactionManager, TransactionStatus, UndoEntry};
 use assfs::graph::operations::GraphNamespace;
 use assfs::graph::node::GraphNode;
 use assfs::store::content::ContentStore;
@@ -798,6 +799,364 @@ fn test_graph_persistence() -> io::Result<()> {
         assert!(graph.node_exists(&child));
         assert_eq!(graph.resolve(&parent, EdgeType::Child, "test.txt"), Some(child));
     }
+
+    Ok(())
+}
+
+// --- EC Merge Tests ---
+
+#[test]
+fn test_ec_merge_two_transactions() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    let txn1 = txn_mgr.start_txn()?;
+    let txn2 = txn_mgr.start_txn()?;
+
+    // Merge them.
+    txn_mgr.ec_merge(txn1, txn2);
+
+    // They should share an EC head.
+    let head1 = txn_mgr.find_ec_head(txn1);
+    let head2 = txn_mgr.find_ec_head(txn2);
+    assert_eq!(head1, head2);
+
+    // The EC head should have size 2.
+    let head = txn_mgr.active.get(&head1).unwrap();
+    assert_eq!(head.ec_size, 2);
+
+    Ok(())
+}
+
+#[test]
+fn test_ec_merge_three_transactions_chain() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    let txn1 = txn_mgr.start_txn()?;
+    let txn2 = txn_mgr.start_txn()?;
+    let txn3 = txn_mgr.start_txn()?;
+
+    // Chain merge: txn1+txn2, then txn2+txn3.
+    txn_mgr.ec_merge(txn1, txn2);
+    txn_mgr.ec_merge(txn2, txn3);
+
+    // All should share the same EC head.
+    let head1 = txn_mgr.find_ec_head(txn1);
+    let head2 = txn_mgr.find_ec_head(txn2);
+    let head3 = txn_mgr.find_ec_head(txn3);
+    assert_eq!(head1, head2);
+    assert_eq!(head2, head3);
+
+    // EC size should be 3.
+    let head = txn_mgr.active.get(&head1).unwrap();
+    assert_eq!(head.ec_size, 3);
+
+    Ok(())
+}
+
+#[test]
+fn test_ec_singleton_commits_normally() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    let obj_id = uuid::Uuid::new_v4();
+    let hash = content_hash(b"solo");
+
+    let txn_id = txn_mgr.start_txn()?;
+    txn_mgr.log_content_change(txn_id, obj_id, None, Some(hash))?;
+
+    // end_txn on a singleton should commit immediately.
+    let pending = txn_mgr.end_txn(txn_id)?;
+    // Pending writes are returned (empty in this case since we didn't buffer).
+    assert!(pending.is_empty());
+    assert!(!txn_mgr.has_active_transactions());
+
+    // Verify log has Data + End records.
+    let records = LogManager::read_all_records(&log_path)?;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].record_type, LogRecordType::Data);
+    assert_eq!(records[1].record_type, LogRecordType::End);
+
+    Ok(())
+}
+
+#[test]
+fn test_ec_size_tracking_after_merges() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    let txn1 = txn_mgr.start_txn()?;
+    let txn2 = txn_mgr.start_txn()?;
+    let txn3 = txn_mgr.start_txn()?;
+    let txn4 = txn_mgr.start_txn()?;
+
+    // Two separate ECs: {txn1, txn2} and {txn3, txn4}.
+    txn_mgr.ec_merge(txn1, txn2);
+    txn_mgr.ec_merge(txn3, txn4);
+
+    let head_a = txn_mgr.find_ec_head(txn1);
+    let head_b = txn_mgr.find_ec_head(txn3);
+    assert_eq!(txn_mgr.active.get(&head_a).unwrap().ec_size, 2);
+    assert_eq!(txn_mgr.active.get(&head_b).unwrap().ec_size, 2);
+
+    // Now merge the two ECs.
+    txn_mgr.ec_merge(txn1, txn3);
+    let final_head = txn_mgr.find_ec_head(txn1);
+    assert_eq!(txn_mgr.active.get(&final_head).unwrap().ec_size, 4);
+
+    // All four should resolve to the same head.
+    assert_eq!(txn_mgr.find_ec_head(txn2), final_head);
+    assert_eq!(txn_mgr.find_ec_head(txn3), final_head);
+    assert_eq!(txn_mgr.find_ec_head(txn4), final_head);
+
+    Ok(())
+}
+
+#[test]
+fn test_find_ec_head_walks_chain() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    let txn1 = txn_mgr.start_txn()?;
+    let txn2 = txn_mgr.start_txn()?;
+    let txn3 = txn_mgr.start_txn()?;
+
+    // Initially each is its own head.
+    assert_eq!(txn_mgr.find_ec_head(txn1), txn1);
+    assert_eq!(txn_mgr.find_ec_head(txn2), txn2);
+    assert_eq!(txn_mgr.find_ec_head(txn3), txn3);
+
+    // Merge txn1 into txn2 (txn2 is larger or equal, becomes head).
+    txn_mgr.ec_merge(txn1, txn2);
+    let head_after_first = txn_mgr.find_ec_head(txn1);
+    assert_eq!(txn_mgr.find_ec_head(txn2), head_after_first);
+
+    // Now merge txn3 with txn1 — should follow chain txn1 -> head_after_first.
+    txn_mgr.ec_merge(txn3, txn1);
+    let final_head = txn_mgr.find_ec_head(txn3);
+    assert_eq!(txn_mgr.find_ec_head(txn1), final_head);
+    assert_eq!(txn_mgr.find_ec_head(txn2), final_head);
+
+    Ok(())
+}
+
+#[test]
+fn test_end_txn_ec_non_last_returns_empty_last_returns_all() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    let obj1 = uuid::Uuid::new_v4();
+    let obj2 = uuid::Uuid::new_v4();
+
+    let txn1 = txn_mgr.start_txn()?;
+    let txn2 = txn_mgr.start_txn()?;
+
+    // Log some operations.
+    txn_mgr.log_content_change(txn1, obj1, None, Some(EMPTY_HASH))?;
+    txn_mgr.log_content_change(txn2, obj2, None, Some(EMPTY_HASH))?;
+
+    // Add pending writes to each transaction.
+    txn_mgr.active.get_mut(&txn1).unwrap()
+        .pending_writes.push((obj1, b"data1".to_vec()));
+    txn_mgr.active.get_mut(&txn2).unwrap()
+        .pending_writes.push((obj2, b"data2".to_vec()));
+
+    // Merge them.
+    txn_mgr.ec_merge(txn1, txn2);
+
+    // First to end: non-last member returns empty pending_writes.
+    let pending1 = txn_mgr.end_txn(txn1)?;
+    assert!(pending1.is_empty());
+    // Transaction should be marked Pending (still in active set).
+    assert_eq!(
+        txn_mgr.active.get(&txn1).map(|t| t.status),
+        Some(TransactionStatus::Pending)
+    );
+
+    // Last to end: returns ALL pending_writes from the entire EC.
+    let pending2 = txn_mgr.end_txn(txn2)?;
+    assert_eq!(pending2.len(), 2);
+    assert!(!txn_mgr.has_active_transactions());
+
+    // Verify log has BEND for the non-head member and END for the head.
+    let records = LogManager::read_all_records(&log_path)?;
+    let bend_records: Vec<_> = records.iter()
+        .filter(|r| r.record_type == LogRecordType::BatchEnd)
+        .collect();
+    let end_records: Vec<_> = records.iter()
+        .filter(|r| r.record_type == LogRecordType::End)
+        .collect();
+    assert_eq!(bend_records.len(), 1);
+    assert_eq!(end_records.len(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn test_recovery_bend_committed_ec() -> io::Result<()> {
+    // An EC with BEND + END should be committed (all members redone).
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+    let store = ContentStore::open(dir.path())?;
+    let graph = GraphNamespace::open(dir.path())?;
+
+    let obj1 = uuid::Uuid::new_v4();
+    let obj2 = uuid::Uuid::new_v4();
+    let hash1 = content_hash(b"ec-member1");
+    let hash2 = content_hash(b"ec-member2");
+
+    store.register_empty(obj1);
+    store.register_empty(obj2);
+
+    // Write log: txn 1 (member, BEND) and txn 2 (head, END).
+    {
+        let mut log = LogManager::open(&log_path)?;
+        // Txn 1 data.
+        log.log_data(
+            1,
+            LogPayload::ContentChange {
+                object_id: obj1,
+                old_hash: None,
+                new_hash: Some(hash1),
+            },
+        )?;
+        // Txn 2 data.
+        log.log_data(
+            2,
+            LogPayload::ContentChange {
+                object_id: obj2,
+                old_hash: None,
+                new_hash: Some(hash2),
+            },
+        )?;
+        // BEND for txn 1, ec_head = 2.
+        log.log_batch_end(1, 2)?;
+        // END for txn 2 (the head).
+        log.log_end(2)?;
+    }
+
+    // Simulate crash: neither hash is in the index.
+    store.set_hash(obj1, EMPTY_HASH);
+    store.set_hash(obj2, EMPTY_HASH);
+
+    // Run recovery -- both should be redone.
+    let result = recovery::recover(&log_path, &store, &graph)?;
+    assert_eq!(result.committed_count, 2);
+    assert_eq!(result.uncommitted_count, 0);
+
+    assert_eq!(store.get_hash(&obj1), Some(hash1));
+    assert_eq!(store.get_hash(&obj2), Some(hash2));
+
+    Ok(())
+}
+
+#[test]
+fn test_recovery_bend_uncommitted_ec() -> io::Result<()> {
+    // An EC with BEND but no END for its head should be uncommitted (all members undone).
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+    let store = ContentStore::open(dir.path())?;
+    let graph = GraphNamespace::open(dir.path())?;
+
+    let obj1 = uuid::Uuid::new_v4();
+    let obj2 = uuid::Uuid::new_v4();
+    let old_hash1 = content_hash(b"original1");
+    let old_hash2 = content_hash(b"original2");
+    let new_hash1 = content_hash(b"modified1");
+    let new_hash2 = content_hash(b"modified2");
+
+    store.put_object(obj1, b"original1")?;
+    store.put_object(obj2, b"original2")?;
+
+    // Write log: txn 1 (member, BEND) and txn 2 (head, NO END -- crash).
+    {
+        let mut log = LogManager::open(&log_path)?;
+        log.log_data(
+            1,
+            LogPayload::ContentChange {
+                object_id: obj1,
+                old_hash: Some(old_hash1),
+                new_hash: Some(new_hash1),
+            },
+        )?;
+        log.log_data(
+            2,
+            LogPayload::ContentChange {
+                object_id: obj2,
+                old_hash: Some(old_hash2),
+                new_hash: Some(new_hash2),
+            },
+        )?;
+        // BEND for txn 1, ec_head = 2.
+        log.log_batch_end(1, 2)?;
+        // No END for txn 2 -- simulating crash before EC commit.
+    }
+
+    // Simulate crash: both were partially updated.
+    store.set_hash(obj1, new_hash1);
+    store.set_hash(obj2, new_hash2);
+
+    // Run recovery -- both should be undone.
+    let result = recovery::recover(&log_path, &store, &graph)?;
+    assert_eq!(result.committed_count, 0);
+    assert_eq!(result.uncommitted_count, 2);
+
+    assert_eq!(store.get_hash(&obj1), Some(old_hash1));
+    assert_eq!(store.get_hash(&obj2), Some(old_hash2));
+
+    Ok(())
+}
+
+#[test]
+fn test_tlock_touch_and_release() {
+    let tlocks = TlockTable::new();
+    let node_id = uuid::Uuid::new_v4();
+
+    // First touch: no conflict.
+    assert_eq!(tlocks.touch(node_id, 1), None);
+
+    // Same transaction touches again: no conflict.
+    assert_eq!(tlocks.touch(node_id, 1), None);
+
+    // Different transaction: conflict.
+    assert_eq!(tlocks.touch(node_id, 2), Some(1));
+
+    // Release txn 2's locks.
+    tlocks.release_all(2);
+
+    // Now txn 3 touches: no conflict (previous holder was released).
+    assert_eq!(tlocks.touch(node_id, 3), None);
+}
+
+#[test]
+fn test_ec_merge_idempotent() -> io::Result<()> {
+    // Merging the same pair twice should be harmless.
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    let txn1 = txn_mgr.start_txn()?;
+    let txn2 = txn_mgr.start_txn()?;
+
+    txn_mgr.ec_merge(txn1, txn2);
+    let head_after_first = txn_mgr.find_ec_head(txn1);
+    let size_after_first = txn_mgr.active.get(&head_after_first).unwrap().ec_size;
+
+    // Merge again -- should be a no-op (same EC head).
+    txn_mgr.ec_merge(txn1, txn2);
+    let head_after_second = txn_mgr.find_ec_head(txn1);
+    let size_after_second = txn_mgr.active.get(&head_after_second).unwrap().ec_size;
+
+    assert_eq!(head_after_first, head_after_second);
+    assert_eq!(size_after_first, size_after_second);
+    assert_eq!(size_after_second, 2);
 
     Ok(())
 }

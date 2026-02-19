@@ -45,6 +45,8 @@ pub enum LogRecordType {
     Data,
     /// Transaction end (commit marker).
     End,
+    /// Batch end — member of an EC that has finished.
+    BatchEnd,
     /// Checkpoint record.
     Checkpoint,
     /// Restart sentinel (written at recovery completion).
@@ -88,6 +90,10 @@ pub enum LogPayload {
         target: ObjectId,
         edge_type: EdgeType,
         label: String,
+    },
+    /// Batch end — this member is part of an EC headed by ec_head.
+    BatchEnd {
+        ec_head: TransactionId,
     },
 }
 
@@ -160,6 +166,20 @@ impl LogManager {
             record_type: LogRecordType::End,
             transaction_id: txn_id,
             payload: None,
+        })
+    }
+
+    /// Write a batch end record for an EC member.
+    pub fn log_batch_end(
+        &mut self,
+        member_id: TransactionId,
+        head_id: TransactionId,
+    ) -> io::Result<LogSequenceNumber> {
+        self.append(LogRecord {
+            lsn: self.next_lsn,
+            record_type: LogRecordType::BatchEnd,
+            transaction_id: member_id,
+            payload: Some(LogPayload::BatchEnd { ec_head: head_id }),
         })
     }
 

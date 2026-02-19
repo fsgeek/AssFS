@@ -6,7 +6,7 @@
 //!
 //! Both the object index and the graph state are corrected.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
@@ -42,10 +42,15 @@ pub fn recover(
         });
     }
 
-    // Phase 1: Identify committed transactions (those with an End record).
+    // Phase 1: Identify committed transactions.
+    // A transaction is committed if:
+    //   - It has an END record (singleton or EC head), OR
+    //   - It has a BEND record and its EC head has an END record.
     let mut committed: HashSet<TransactionId> = HashSet::new();
     let mut all_txn_ids: HashSet<TransactionId> = HashSet::new();
     let mut max_txn_id: TransactionId = 0;
+    // EC membership: member -> ec_head (from BEND records).
+    let mut ec_membership: HashMap<TransactionId, TransactionId> = HashMap::new();
 
     for record in &records {
         if record.transaction_id > 0 {
@@ -56,6 +61,18 @@ pub fn recover(
         }
         if record.record_type == LogRecordType::End {
             committed.insert(record.transaction_id);
+        }
+        if record.record_type == LogRecordType::BatchEnd {
+            if let Some(LogPayload::BatchEnd { ec_head }) = &record.payload {
+                ec_membership.insert(record.transaction_id, *ec_head);
+            }
+        }
+    }
+
+    // A transaction with BEND is committed if its ec_head has an END record.
+    for (&member_id, &head_id) in &ec_membership {
+        if committed.contains(&head_id) {
+            committed.insert(member_id);
         }
     }
 
@@ -186,6 +203,9 @@ fn redo_payload(payload: &LogPayload, store: &ContentStore, graph: &GraphNamespa
         } => {
             graph.remove_edge(source, *edge_type, label);
         }
+        // BatchEnd payloads carry no mutation data — EC membership is handled
+        // at the transaction level, not per-record.
+        LogPayload::BatchEnd { .. } => {}
     }
 }
 
@@ -233,5 +253,7 @@ fn undo_payload(payload: &LogPayload, store: &ContentStore, graph: &GraphNamespa
         } => {
             let _ = graph.add_edge(*source, *target, *edge_type, label.clone());
         }
+        // BatchEnd payloads carry no mutation data.
+        LogPayload::BatchEnd { .. } => {}
     }
 }

@@ -19,6 +19,7 @@ use crate::projection::{InodeTable, Ino};
 use crate::stats::FsStats;
 use crate::store::content::ContentStore;
 use crate::txn::recovery;
+use crate::txn::tlock::TlockTable;
 use crate::txn::transaction::TransactionManager;
 use crate::{EdgeType, NodeType, ObjectId, EMPTY_HASH};
 
@@ -36,6 +37,7 @@ pub struct AssFs {
     pub root_id: ObjectId,
     /// Tag registry node — edges to all tag anchor nodes.
     pub tag_registry_id: ObjectId,
+    pub tlocks: TlockTable,
     pub stats: FsStats,
     pub stats_file: Option<PathBuf>,
     pub no_sync: bool,
@@ -122,6 +124,7 @@ impl AssFs {
             inodes,
             root_id,
             tag_registry_id,
+            tlocks: TlockTable::new(),
             stats: FsStats::new(),
             stats_file: None,
             no_sync: false,
@@ -387,47 +390,62 @@ impl Filesystem for AssFs {
             return;
         }
 
-        // Start transaction.
-        let mut txn_mgr = self.txn_mgr.lock().unwrap();
-        let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => {
-                self.stats.txn_started.fetch_add(1, Relaxed);
-                id
-            }
-            Err(_) => {
-                reply.error(libc::ENOSPC);
-                return;
+        // 1. Start transaction (brief lock).
+        let txn_id = {
+            let mut txn_mgr = self.txn_mgr.lock().unwrap();
+            match txn_mgr.start_txn() {
+                Ok(id) => {
+                    self.stats.txn_started.fetch_add(1, Relaxed);
+                    id
+                }
+                Err(_) => {
+                    reply.error(libc::ENOSPC);
+                    return;
+                }
             }
         };
 
-        // Create new file node.
+        // 2. Touch tlocks (may trigger EC merge).
+        if let Some(other) = self.tlocks.touch(parent_id, txn_id) {
+            let mut txn_mgr = self.txn_mgr.lock().unwrap();
+            txn_mgr.ec_merge(txn_id, other);
+        }
+
+        // 3. Create new file node.
         let file_id = uuid::Uuid::new_v4();
         let file_node = GraphNode::new_file(file_id, req.uid(), req.gid(), mode);
         let node_data = bincode::serialize(&file_node).unwrap_or_default();
 
-        // Log node addition, edge addition, and content registration.
-        if txn_mgr
-            .log_add_node(txn_id, file_id, node_data)
-            .is_err()
-            || txn_mgr
-                .log_add_edge(
-                    txn_id,
-                    parent_id,
-                    file_id,
-                    EdgeType::Child,
-                    name_str.to_string(),
-                )
-                .is_err()
-            || txn_mgr
-                .log_content_change(txn_id, file_id, None, Some(EMPTY_HASH))
-                .is_err()
+        // 4. Touch tlock for the new node (no conflict possible, new node).
+        self.tlocks.touch(file_id, txn_id);
+
+        // 5. Log operations (brief lock).
         {
-            let _ = txn_mgr.abort_txn(txn_id);
-            reply.error(libc::EIO);
-            return;
+            let mut txn_mgr = self.txn_mgr.lock().unwrap();
+            if txn_mgr
+                .log_add_node(txn_id, file_id, node_data)
+                .is_err()
+                || txn_mgr
+                    .log_add_edge(
+                        txn_id,
+                        parent_id,
+                        file_id,
+                        EdgeType::Child,
+                        name_str.to_string(),
+                    )
+                    .is_err()
+                || txn_mgr
+                    .log_content_change(txn_id, file_id, None, Some(EMPTY_HASH))
+                    .is_err()
+            {
+                let _ = txn_mgr.abort_txn(txn_id);
+                self.tlocks.release_all(txn_id);
+                reply.error(libc::EIO);
+                return;
+            }
         }
 
-        // Apply to in-memory state.
+        // 6. Apply to in-memory state.
         self.graph.add_node(file_node.clone());
         if let Err(_) = self.graph.add_edge(
             parent_id,
@@ -435,21 +453,39 @@ impl Filesystem for AssFs {
             EdgeType::Child,
             name_str.to_string(),
         ) {
+            let mut txn_mgr = self.txn_mgr.lock().unwrap();
             let _ = txn_mgr.abort_txn(txn_id);
+            self.tlocks.release_all(txn_id);
             reply.error(libc::EIO);
             return;
         }
         self.store.register_empty(file_id);
 
-        // Commit.
-        let _pending = match txn_mgr.commit_txn(txn_id) {
-            Ok(p) => p,
-            Err(_) => {
-                reply.error(libc::EIO);
-                return;
+        // 7. End transaction (brief lock, may or may not commit depending on EC).
+        let pending = {
+            let mut txn_mgr = self.txn_mgr.lock().unwrap();
+            match txn_mgr.end_txn(txn_id) {
+                Ok(p) => p,
+                Err(_) => {
+                    self.tlocks.release_all(txn_id);
+                    reply.error(libc::EIO);
+                    return;
+                }
             }
         };
         self.stats.txn_committed.fetch_add(1, Relaxed);
+
+        // 8. Flush pending writes if NO-STEAL and EC committed.
+        if self.no_steal && !pending.is_empty() {
+            if let Err(_) = self.store.flush_pending(&pending) {
+                self.tlocks.release_all(txn_id);
+                reply.error(libc::EIO);
+                return;
+            }
+        }
+
+        // 9. Release tlocks.
+        self.tlocks.release_all(txn_id);
 
         let attr = self.node_to_attr(&file_node);
         reply.created(&TTL, &attr, 0, 0, 0);

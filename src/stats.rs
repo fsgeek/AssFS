@@ -78,6 +78,14 @@ pub struct FsStats {
     // Transaction lifecycle.
     pub txn_started: AtomicU64,
     pub txn_committed: AtomicU64,
+
+    // EC merge counters.
+    /// Number of EC merge operations.
+    pub ec_merges: AtomicU64,
+    /// Largest EC seen.
+    pub ec_max_size: AtomicU64,
+    /// Number of EC group commits (vs singleton).
+    pub ec_commits: AtomicU64,
 }
 
 impl FsStats {
@@ -105,6 +113,9 @@ impl FsStats {
             write_bytes: AtomicU64::new(0),
             txn_started: AtomicU64::new(0),
             txn_committed: AtomicU64::new(0),
+            ec_merges: AtomicU64::new(0),
+            ec_max_size: AtomicU64::new(0),
+            ec_commits: AtomicU64::new(0),
         }
     }
 
@@ -160,6 +171,9 @@ impl FsStats {
             txn_aborted: txn_started.saturating_sub(txn_committed),
             read_bytes: self.read_bytes.load(R),
             write_bytes: self.write_bytes.load(R),
+            ec_merges: self.ec_merges.load(R),
+            ec_max_size: self.ec_max_size.load(R),
+            ec_commits: self.ec_commits.load(R),
             log: None,
         }
     }
@@ -213,6 +227,12 @@ impl FsStats {
             "  Transactions: {} started, {} committed, {} aborted",
             snap.txn_started, snap.txn_committed, snap.txn_aborted
         );
+        if snap.ec_merges > 0 {
+            eprintln!(
+                "  EC merge: {} merges, max size {}, {} group commits",
+                snap.ec_merges, snap.ec_max_size, snap.ec_commits
+            );
+        }
 
         if snap.read_bytes > 0 || snap.write_bytes > 0 {
             eprintln!(
@@ -281,6 +301,9 @@ pub struct StatsSnapshot {
     pub txn_aborted: u64,
     pub read_bytes: u64,
     pub write_bytes: u64,
+    pub ec_merges: u64,
+    pub ec_max_size: u64,
+    pub ec_commits: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log: Option<LogStats>,
 }
