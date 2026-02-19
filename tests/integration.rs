@@ -130,7 +130,7 @@ fn test_transaction_commit() -> io::Result<()> {
 
     let txn_id = txn_mgr.start_txn()?;
     txn_mgr.log_content_change(txn_id, obj_id, None, Some(hash))?;
-    txn_mgr.commit_txn(txn_id)?;
+    let _pending = txn_mgr.commit_txn(txn_id)?;
 
     assert!(!txn_mgr.has_active_transactions());
 

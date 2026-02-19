@@ -39,6 +39,7 @@ pub struct AssFs {
     pub stats: FsStats,
     pub stats_file: Option<PathBuf>,
     pub no_sync: bool,
+    pub no_steal: bool,
     #[allow(dead_code)]
     data_dir: PathBuf,
 }
@@ -124,6 +125,7 @@ impl AssFs {
             stats: FsStats::new(),
             stats_file: None,
             no_sync: false,
+            no_steal: false,
             data_dir: data_dir.to_path_buf(),
         })
     }
@@ -135,6 +137,14 @@ impl AssFs {
             let mut txn_mgr = self.txn_mgr.lock().unwrap();
             txn_mgr.log.no_sync = true;
             log::warn!("AssFS: --no-sync enabled. Crash recovery is UNSAFE.");
+        }
+    }
+
+    /// Enable no-steal mode: buffer content writes until commit (for measurement).
+    pub fn set_no_steal(&mut self, no_steal: bool) {
+        self.no_steal = no_steal;
+        if no_steal {
+            log::warn!("NO-STEAL mode: content writes buffered until commit (for measurement)");
         }
     }
 
@@ -432,10 +442,13 @@ impl Filesystem for AssFs {
         self.store.register_empty(file_id);
 
         // Commit.
-        if let Err(_) = txn_mgr.commit_txn(txn_id) {
-            reply.error(libc::EIO);
-            return;
-        }
+        let _pending = match txn_mgr.commit_txn(txn_id) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         self.stats.txn_committed.fetch_add(1, Relaxed);
 
         let attr = self.node_to_attr(&file_node);
@@ -532,10 +545,13 @@ impl Filesystem for AssFs {
             n.metadata.nlink += 1;
         });
 
-        if let Err(_) = txn_mgr.commit_txn(txn_id) {
-            reply.error(libc::EIO);
-            return;
-        }
+        let _pending = match txn_mgr.commit_txn(txn_id) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         self.stats.txn_committed.fetch_add(1, Relaxed);
 
         let attr = self.node_to_attr(&dir_node);
@@ -642,10 +658,13 @@ impl Filesystem for AssFs {
             });
         }
 
-        if let Err(_) = txn_mgr.commit_txn(txn_id) {
-            reply.error(libc::EIO);
-            return;
-        }
+        let _pending = match txn_mgr.commit_txn(txn_id) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         self.stats.txn_committed.fetch_add(1, Relaxed);
 
         reply.ok();
@@ -747,10 +766,13 @@ impl Filesystem for AssFs {
             n.metadata.nlink = n.metadata.nlink.saturating_sub(1);
         });
 
-        if let Err(_) = txn_mgr.commit_txn(txn_id) {
-            reply.error(libc::EIO);
-            return;
-        }
+        let _pending = match txn_mgr.commit_txn(txn_id) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         self.stats.txn_committed.fetch_add(1, Relaxed);
 
         reply.ok();
@@ -902,13 +924,29 @@ impl Filesystem for AssFs {
             }
         };
 
-        // Store new content.
-        let new_hash = match self.store.put_object(obj_id, &content) {
-            Ok(h) => h,
-            Err(_) => {
-                let _ = txn_mgr.abort_txn(txn_id);
-                reply.error(libc::EIO);
-                return;
+        // Store new content (or buffer in NO-STEAL mode).
+        let new_hash = if self.no_steal {
+            match self.store.put_object_buffered(obj_id, &content) {
+                Ok(h) => {
+                    // Stash the data in pending_writes for flush at commit.
+                    txn_mgr.active.get_mut(&txn_id).unwrap()
+                        .pending_writes.push((obj_id, content.clone()));
+                    h
+                }
+                Err(_) => {
+                    let _ = txn_mgr.abort_txn(txn_id);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            }
+        } else {
+            match self.store.put_object(obj_id, &content) {
+                Ok(h) => h,
+                Err(_) => {
+                    let _ = txn_mgr.abort_txn(txn_id);
+                    reply.error(libc::EIO);
+                    return;
+                }
             }
         };
 
@@ -930,9 +968,20 @@ impl Filesystem for AssFs {
             node.metadata.ctime_nsec = nsec;
         });
 
-        if let Err(_) = txn_mgr.commit_txn(txn_id) {
-            reply.error(libc::EIO);
-            return;
+        let pending = match txn_mgr.commit_txn(txn_id) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
+        // NO-STEAL: flush buffered content writes to disk now that the
+        // transaction is committed.
+        if self.no_steal && !pending.is_empty() {
+            if let Err(_) = self.store.flush_pending(&pending) {
+                reply.error(libc::EIO);
+                return;
+            }
         }
         self.stats.txn_committed.fetch_add(1, Relaxed);
 
@@ -1038,10 +1087,13 @@ impl Filesystem for AssFs {
             n.metadata.ctime_nsec = nsec;
         });
 
-        if let Err(_) = txn_mgr.commit_txn(txn_id) {
-            reply.error(libc::EIO);
-            return;
-        }
+        let _pending = match txn_mgr.commit_txn(txn_id) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         self.stats.txn_committed.fetch_add(1, Relaxed);
 
         match self.graph.get_node(&target_id) {
@@ -1216,10 +1268,13 @@ impl Filesystem for AssFs {
             }
         }
 
-        if let Err(_) = txn_mgr.commit_txn(txn_id) {
-            reply.error(libc::EIO);
-            return;
-        }
+        let _pending = match txn_mgr.commit_txn(txn_id) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         self.stats.txn_committed.fetch_add(1, Relaxed);
 
         reply.ok();
@@ -1408,10 +1463,13 @@ impl Filesystem for AssFs {
             return;
         }
 
-        if txn_mgr.commit_txn(txn_id).is_err() {
-            reply.error(libc::EIO);
-            return;
-        }
+        let _pending = match txn_mgr.commit_txn(txn_id) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         self.stats.txn_committed.fetch_add(1, Relaxed);
 
         log::debug!("Tagged ino {} with '{}'", ino, tag_name);
@@ -1594,10 +1652,13 @@ impl Filesystem for AssFs {
 
         self.graph.remove_edge(&obj_id, EdgeType::Tag, tag_name);
 
-        if txn_mgr.commit_txn(txn_id).is_err() {
-            reply.error(libc::EIO);
-            return;
-        }
+        let _pending = match txn_mgr.commit_txn(txn_id) {
+            Ok(p) => p,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
         self.stats.txn_committed.fetch_add(1, Relaxed);
 
         log::debug!("Untagged ino {} from '{}'", ino, tag_name);

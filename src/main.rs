@@ -16,6 +16,7 @@ fn main() {
         eprintln!("  --data-dir <path>     Where to store data (default: ~/.assfs)");
         eprintln!("  --stats-file <path>   Write JSON stats on unmount");
         eprintln!("  --no-sync             Skip fsync (UNSAFE, for measurement only)");
+        eprintln!("  --no-steal            Buffer content writes until commit (for measurement)");
         std::process::exit(1);
     }
 
@@ -68,6 +69,9 @@ fn main() {
     if args.iter().any(|a| a == "--no-sync") {
         fs.set_no_sync(true);
     }
+    if args.iter().any(|a| a == "--no-steal") {
+        fs.set_no_steal(true);
+    }
 
     let options = vec![
         MountOption::AutoUnmount,
@@ -89,6 +93,9 @@ fn main() {
         fs2.stats_file = stats_file;
         if args.iter().any(|a| a == "--no-sync") {
             fs2.set_no_sync(true);
+        }
+        if args.iter().any(|a| a == "--no-steal") {
+            fs2.set_no_steal(true);
         }
         if let Err(e) = fuser::mount2(fs2, &mountpoint, &options) {
             eprintln!("Failed to mount: {}", e);

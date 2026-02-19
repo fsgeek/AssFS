@@ -124,6 +124,45 @@ impl ContentStore {
         Ok(std::fs::metadata(&path)?.len())
     }
 
+    /// Buffer a write for deferred flush (NO-STEAL mode).
+    /// Updates the in-memory index so reads see the new data,
+    /// but does NOT write the blob to disk.
+    pub fn put_object_buffered(
+        &self,
+        object_id: ObjectId,
+        data: &[u8],
+    ) -> io::Result<ContentHash> {
+        let hash = crate::content_hash(data);
+        let mut idx = self.index.lock().unwrap();
+        idx.entries.insert(object_id, hash);
+        Ok(hash)
+    }
+
+    /// Flush buffered writes to disk. Called on commit in NO-STEAL mode.
+    pub fn flush_pending(&self, pending: &[(ObjectId, Vec<u8>)]) -> io::Result<()> {
+        for (_object_id, data) in pending {
+            self.backend.put(data)?;
+        }
+        Ok(())
+    }
+
+    /// Read content, checking pending writes first (NO-STEAL safety).
+    /// Falls back to on-disk content if not found in pending.
+    pub fn get_content_or_pending(
+        &self,
+        object_id: &ObjectId,
+        pending: &[(ObjectId, Vec<u8>)],
+    ) -> io::Result<Vec<u8>> {
+        // Check pending writes first (most recent write wins).
+        for (id, data) in pending.iter().rev() {
+            if id == object_id {
+                return Ok(data.clone());
+            }
+        }
+        // Fall through to on-disk content.
+        self.get_content(object_id)
+    }
+
     /// Persist the object index to disk.
     pub fn flush_index(&self) -> io::Result<()> {
         let idx = self.index.lock().unwrap();

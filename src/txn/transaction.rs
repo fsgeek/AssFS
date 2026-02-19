@@ -60,6 +60,8 @@ pub struct Transaction {
     pub last_lsn: Option<LogSequenceNumber>,
     /// Ordered list of undo entries (applied in reverse on abort).
     pub undo_log: Vec<UndoEntry>,
+    /// NO-STEAL: content data buffered until commit.
+    pub pending_writes: Vec<(ObjectId, Vec<u8>)>,
 }
 
 /// The transaction manager.
@@ -67,7 +69,7 @@ pub struct TransactionManager {
     pub log: LogManager,
     admission: AdmissionController,
     next_txn_id: TransactionId,
-    active: HashMap<TransactionId, Transaction>,
+    pub active: HashMap<TransactionId, Transaction>,
 }
 
 impl TransactionManager {
@@ -110,6 +112,7 @@ impl TransactionManager {
             first_lsn: None,
             last_lsn: None,
             undo_log: Vec::new(),
+            pending_writes: Vec::new(),
         };
 
         self.active.insert(id, txn);
@@ -256,7 +259,8 @@ impl TransactionManager {
     // --- Transaction lifecycle ---
 
     /// Commit a transaction: write END record, sync, mark committed.
-    pub fn commit_txn(&mut self, txn_id: TransactionId) -> io::Result<()> {
+    /// Returns any pending writes (NO-STEAL mode) so the caller can flush them.
+    pub fn commit_txn(&mut self, txn_id: TransactionId) -> io::Result<Vec<(ObjectId, Vec<u8>)>> {
         let lsn = self.log.log_end(txn_id)?;
 
         let txn = self
@@ -267,9 +271,9 @@ impl TransactionManager {
         txn.last_lsn = Some(lsn);
         txn.status = TransactionStatus::Committed;
         self.admission.release(&txn.reservation);
-        self.active.remove(&txn_id);
+        let txn = self.active.remove(&txn_id).unwrap();
 
-        Ok(())
+        Ok(txn.pending_writes)
     }
 
     /// Abort a transaction. Returns the undo log so the caller can revert
