@@ -1715,5 +1715,11 @@ impl Filesystem for AssFs {
                 }
             }
         }
+        // Directory mutation frequency distribution.
+        let summary = self.tlocks.access_summary();
+        if summary.total_touches > 0 {
+            eprintln!("\n=== Directory Mutation Distribution ===");
+            eprint!("{}", summary);
+        }
     }
 }
