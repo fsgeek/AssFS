@@ -86,6 +86,8 @@ pub struct FsStats {
     pub ec_max_size: AtomicU64,
     /// Number of EC group commits (vs singleton).
     pub ec_commits: AtomicU64,
+    /// Number of proactive checkpoints triggered by FUSE ops.
+    pub checkpoint_count: AtomicU64,
 }
 
 impl FsStats {
@@ -116,6 +118,7 @@ impl FsStats {
             ec_merges: AtomicU64::new(0),
             ec_max_size: AtomicU64::new(0),
             ec_commits: AtomicU64::new(0),
+            checkpoint_count: AtomicU64::new(0),
         }
     }
 
@@ -174,6 +177,7 @@ impl FsStats {
             ec_merges: self.ec_merges.load(R),
             ec_max_size: self.ec_max_size.load(R),
             ec_commits: self.ec_commits.load(R),
+            checkpoint_count: self.checkpoint_count.load(R),
             log: None,
         }
     }
@@ -231,6 +235,12 @@ impl FsStats {
             eprintln!(
                 "  EC merge: {} merges, max size {}, {} group commits",
                 snap.ec_merges, snap.ec_max_size, snap.ec_commits
+            );
+        }
+        if snap.checkpoint_count > 0 {
+            eprintln!(
+                "  Proactive checkpoints: {}",
+                snap.checkpoint_count
             );
         }
 
@@ -304,6 +314,7 @@ pub struct StatsSnapshot {
     pub ec_merges: u64,
     pub ec_max_size: u64,
     pub ec_commits: u64,
+    pub checkpoint_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log: Option<LogStats>,
 }

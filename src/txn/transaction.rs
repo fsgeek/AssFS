@@ -76,7 +76,7 @@ pub struct Transaction {
 /// The transaction manager.
 pub struct TransactionManager {
     pub log: LogManager,
-    admission: AdmissionController,
+    pub admission: AdmissionController,
     next_txn_id: TransactionId,
     pub active: HashMap<TransactionId, Transaction>,
 }
@@ -273,6 +273,20 @@ impl TransactionManager {
     /// Commit a transaction: write END record, sync, mark committed.
     /// Returns any pending writes (NO-STEAL mode) so the caller can flush them.
     pub fn commit_txn(&mut self, txn_id: TransactionId) -> io::Result<Vec<(ObjectId, Vec<u8>)>> {
+        // Progressive release: tighten reservation before writing END.
+        // This releases unused data space back to the global pool,
+        // allowing other transactions to start sooner.
+        {
+            let txn = self
+                .active
+                .get_mut(&txn_id)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "transaction not found"))?;
+            let released = txn.reservation.tighten();
+            if released > 0 {
+                self.admission.release_partial(released);
+            }
+        }
+
         let lsn = self.log.log_end(txn_id)?;
 
         let txn = self
@@ -300,9 +314,38 @@ impl TransactionManager {
         Ok(txn.undo_log)
     }
 
-    /// Write a checkpoint record.
-    pub fn checkpoint(&mut self) -> io::Result<LogSequenceNumber> {
+    /// Write a checkpoint record (without truncation).
+    pub fn log_checkpoint(&mut self) -> io::Result<LogSequenceNumber> {
         self.log.log_checkpoint()
+    }
+
+    /// Full checkpoint: truncate the log and reset admission control.
+    ///
+    /// Precondition: the caller MUST flush graph state and content index
+    /// to disk BEFORE calling this. This method only handles the log and
+    /// admission controller — it doesn't know about graph/store state.
+    ///
+    /// Postcondition: the log contains only a restart sentinel, and
+    /// admission control is fully reset (all space reclaimed).
+    pub fn checkpoint(&mut self) -> io::Result<()> {
+        if !self.active.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "checkpoint with {} active transactions",
+                    self.active.len()
+                ),
+            ));
+        }
+
+        // Truncate the log and write a restart sentinel.
+        self.log.truncate_and_restart()?;
+
+        // Reset admission controller — all log space is reclaimed.
+        self.admission.reset();
+
+        log::info!("Checkpoint complete, admission control reset");
+        Ok(())
     }
 
     /// Check if any transactions are active.
@@ -326,6 +369,12 @@ impl TransactionManager {
 
     /// Merge two transactions into one equivalence class.
     /// Follows Episode's algorithm: fold smaller EC into larger.
+    ///
+    /// Concurrency note: members of the small EC may have already called
+    /// end_txn (status=Pending), which decremented the old small head's
+    /// ec_size. We must only count truly active (non-Pending) members
+    /// when computing the new ec_size on the large head, otherwise the
+    /// EC will never reach ec_size=0 and leak transactions.
     pub fn ec_merge(&mut self, txn1: TransactionId, txn2: TransactionId) {
         if txn1 == txn2 {
             return;
@@ -368,22 +417,32 @@ impl TransactionManager {
             }
         }
 
+        // Count only active (non-Pending) members being transferred.
+        // Members that already called end_txn decremented the old head's
+        // ec_size, so they should not inflate the new head's ec_size.
+        let small_head_active = self.active.get(&small_head)
+            .map_or(false, |t| t.status != TransactionStatus::Pending);
+        let active_member_count: u32 = small_members.iter()
+            .filter(|mid| {
+                self.active.get(mid)
+                    .map_or(false, |t| t.status != TransactionStatus::Pending)
+            })
+            .count() as u32
+            + if small_head_active { 1 } else { 0 };
+
         // Add small head + its members to large EC.
         let large = self.active.get_mut(&large_head).unwrap();
-        large.ec_size += if small_members.is_empty() {
-            1
-        } else {
-            small_members.len() as u32 + 1
-        };
+        large.ec_size += active_member_count;
         large.ec_members.push(small_head);
         large.ec_members.extend(small_members);
 
         log::debug!(
-            "EC merge: txn {} + txn {} -> head {} (size {})",
+            "EC merge: txn {} + txn {} -> head {} (size {}, transferred {} active)",
             txn1,
             txn2,
             large_head,
-            large.ec_size
+            large.ec_size,
+            active_member_count
         );
     }
 
@@ -403,10 +462,14 @@ impl TransactionManager {
         };
 
         if ec_size > 0 {
-            // Not the last member. Mark as pending, don't commit yet.
+            // Not the last member. Tighten reservation and mark as pending.
             let txn = self.active.get_mut(&txn_id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "txn not found")
             })?;
+            let released = txn.reservation.tighten();
+            if released > 0 {
+                self.admission.release_partial(released);
+            }
             txn.status = TransactionStatus::Pending;
             return Ok(Vec::new()); // No pending_writes returned until EC commits
         }

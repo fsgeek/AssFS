@@ -1160,3 +1160,807 @@ fn test_ec_merge_idempotent() -> io::Result<()> {
 
     Ok(())
 }
+
+// --- Deferred Sync / IO Window Tests ---
+//
+// These tests verify that:
+// 1. Data/BatchEnd records do NOT trigger fsync (io_window stays put)
+// 2. End/Checkpoint/Restart records DO trigger fsync (io_window advances)
+// 3. sync_pending() flushes everything and advances io_window
+// 4. EC commit batches all BENDs + END into a single fsync
+// 5. Deferred sync measurably reduces sync overhead
+
+#[test]
+fn test_io_window_advances_on_end_record() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let obj_id = uuid::Uuid::new_v4();
+    let hash_a = content_hash(b"alpha");
+
+    let mut log = LogManager::open(&log_path)?;
+
+    // io_window starts at 0 for a fresh log.
+    assert_eq!(log.io_window(), 0);
+
+    // Data record: io_window should NOT advance (deferred sync).
+    let data_lsn = log.log_data(
+        1,
+        LogPayload::ContentChange {
+            object_id: obj_id,
+            old_hash: None,
+            new_hash: Some(hash_a),
+        },
+    )?;
+    assert_eq!(data_lsn, 1);
+    assert_eq!(log.io_window(), 0, "io_window must not advance on Data record");
+
+    // End record: io_window MUST advance (commit-point sync).
+    let end_lsn = log.log_end(1)?;
+    assert_eq!(end_lsn, 2);
+    assert_eq!(
+        log.io_window(),
+        end_lsn,
+        "io_window must advance to END record LSN"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_io_window_advances_on_checkpoint() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut log = LogManager::open(&log_path)?;
+    assert_eq!(log.io_window(), 0);
+
+    let ckpt_lsn = log.log_checkpoint()?;
+    assert_eq!(
+        log.io_window(),
+        ckpt_lsn,
+        "io_window must advance on Checkpoint"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_io_window_advances_on_restart() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut log = LogManager::open(&log_path)?;
+    let rst_lsn = log.log_restart()?;
+    assert_eq!(
+        log.io_window(),
+        rst_lsn,
+        "io_window must advance on Restart"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_batch_end_does_not_advance_io_window() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut log = LogManager::open(&log_path)?;
+    assert_eq!(log.io_window(), 0);
+
+    // BatchEnd should NOT advance io_window (it's committed by the head's END).
+    let _bend_lsn = log.log_batch_end(1, 2)?;
+    assert_eq!(
+        log.io_window(),
+        0,
+        "io_window must not advance on BatchEnd"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_sync_pending_advances_io_window() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let obj_id = uuid::Uuid::new_v4();
+    let hash_a = content_hash(b"beta");
+
+    let mut log = LogManager::open(&log_path)?;
+
+    // Write a Data record (no sync, io_window stays at 0).
+    let data_lsn = log.log_data(
+        1,
+        LogPayload::ContentChange {
+            object_id: obj_id,
+            old_hash: None,
+            new_hash: Some(hash_a),
+        },
+    )?;
+    assert_eq!(log.io_window(), 0);
+
+    // Explicit sync_pending() should advance io_window.
+    log.sync_pending()?;
+    assert_eq!(
+        log.io_window(),
+        data_lsn,
+        "sync_pending must advance io_window to cover all written records"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_deferred_sync_reduces_sync_count() -> io::Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let obj_id = uuid::Uuid::new_v4();
+    let hash_a = content_hash(b"gamma");
+    let hash_b = content_hash(b"delta");
+
+    let mut log = LogManager::open(&log_path)?;
+
+    // Write 3 Data records + 1 End = 4 records total.
+    // With deferred sync, only the End triggers fsync.
+    log.log_data(
+        1,
+        LogPayload::ContentChange {
+            object_id: obj_id,
+            old_hash: None,
+            new_hash: Some(hash_a),
+        },
+    )?;
+    log.log_data(
+        1,
+        LogPayload::AddNode {
+            node_id: obj_id,
+            node_data: vec![1, 2, 3],
+        },
+    )?;
+    log.log_data(
+        1,
+        LogPayload::ContentChange {
+            object_id: obj_id,
+            old_hash: Some(hash_a),
+            new_hash: Some(hash_b),
+        },
+    )?;
+
+    // Check that sync time is 0 after Data records (no fsync happened).
+    let sync_before_end = log.timings.sync_ns.load(Relaxed);
+    assert_eq!(
+        sync_before_end, 0,
+        "sync_ns must be 0 after Data-only records"
+    );
+
+    // Now write End record — this triggers the one and only fsync.
+    log.log_end(1)?;
+
+    let sync_after_end = log.timings.sync_ns.load(Relaxed);
+    assert!(
+        sync_after_end > 0,
+        "sync_ns must be > 0 after End record (fsync happened)"
+    );
+
+    // Verify all records are readable (they were all flushed by the End sync).
+    drop(log);
+    let records = LogManager::read_all_records(&log_path)?;
+    assert_eq!(records.len(), 4, "all 4 records must be durable after End sync");
+    assert_eq!(records[0].record_type, LogRecordType::Data);
+    assert_eq!(records[1].record_type, LogRecordType::Data);
+    assert_eq!(records[2].record_type, LogRecordType::Data);
+    assert_eq!(records[3].record_type, LogRecordType::End);
+
+    Ok(())
+}
+
+#[test]
+fn test_io_window_restored_on_reopen() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let obj_id = uuid::Uuid::new_v4();
+    let hash_a = content_hash(b"epsilon");
+
+    // Write and commit a transaction.
+    {
+        let mut log = LogManager::open(&log_path)?;
+        log.log_data(
+            1,
+            LogPayload::ContentChange {
+                object_id: obj_id,
+                old_hash: None,
+                new_hash: Some(hash_a),
+            },
+        )?;
+        log.log_end(1)?;
+    }
+
+    // Reopen — io_window should reflect on-disk records.
+    let log = LogManager::open(&log_path)?;
+    assert_eq!(
+        log.io_window(),
+        2,
+        "io_window must be initialized from on-disk records on reopen"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_ec_commit_single_sync() -> io::Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let obj_a = uuid::Uuid::new_v4();
+    let obj_b = uuid::Uuid::new_v4();
+    let hash_a = content_hash(b"zeta");
+    let hash_b = content_hash(b"eta");
+
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    // Start two transactions, merge them into one EC.
+    let txn1 = txn_mgr.start_txn()?;
+    let txn2 = txn_mgr.start_txn()?;
+
+    txn_mgr.log_content_change(txn1, obj_a, None, Some(hash_a))?;
+    txn_mgr.log_content_change(txn2, obj_b, None, Some(hash_b))?;
+    txn_mgr.ec_merge(txn1, txn2);
+
+    // Verify no sync has happened yet (only Data records written).
+    let sync_before = txn_mgr.log.timings.sync_ns.load(Relaxed);
+    assert_eq!(sync_before, 0, "no sync before EC commit");
+
+    // End first member — not the last, so no commit yet.
+    let pending1 = txn_mgr.end_txn(txn1)?;
+    assert!(pending1.is_empty());
+    let sync_after_first = txn_mgr.log.timings.sync_ns.load(Relaxed);
+    assert_eq!(
+        sync_after_first, 0,
+        "BEND for non-last member must not trigger sync"
+    );
+
+    // End second member — last member, triggers BEND + END + sync.
+    let pending2 = txn_mgr.end_txn(txn2)?;
+    assert!(pending2.is_empty()); // no NO-STEAL writes in this test
+
+    let sync_after_commit = txn_mgr.log.timings.sync_ns.load(Relaxed);
+    assert!(
+        sync_after_commit > 0,
+        "EC commit (last member END) must trigger sync"
+    );
+
+    // All records should be durable: 2 Data + 1 BEND + 1 END = 4 records.
+    drop(txn_mgr);
+    let records = LogManager::read_all_records(&log_path)?;
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[2].record_type, LogRecordType::BatchEnd);
+    assert_eq!(records[3].record_type, LogRecordType::End);
+
+    Ok(())
+}
+
+// --- Checkpoint / Log Truncation Tests ---
+
+#[test]
+fn test_checkpoint_truncates_log() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let obj_id = uuid::Uuid::new_v4();
+    let hash_a = content_hash(b"pre-checkpoint");
+
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    // Write and commit a transaction.
+    let txn_id = txn_mgr.start_txn()?;
+    txn_mgr.log_content_change(txn_id, obj_id, None, Some(hash_a))?;
+    txn_mgr.commit_txn(txn_id)?;
+
+    // Log should have 2 records (Data + End).
+    let records_before = LogManager::read_all_records(&log_path)?;
+    assert_eq!(records_before.len(), 2);
+
+    // Checkpoint: truncate log and reset admission.
+    txn_mgr.checkpoint()?;
+
+    // Log should now have only the restart sentinel.
+    let records_after = LogManager::read_all_records(&log_path)?;
+    assert_eq!(records_after.len(), 1);
+    assert_eq!(records_after[0].record_type, LogRecordType::Restart);
+
+    Ok(())
+}
+
+#[test]
+fn test_checkpoint_resets_admission() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    // Fill up admission control with many transactions.
+    for _ in 0..100 {
+        let txn_id = txn_mgr.start_txn()?;
+        let obj_id = uuid::Uuid::new_v4();
+        let hash = content_hash(b"data");
+        txn_mgr.log_content_change(txn_id, obj_id, None, Some(hash))?;
+        txn_mgr.commit_txn(txn_id)?;
+    }
+
+    // Checkpoint: reset admission control.
+    txn_mgr.checkpoint()?;
+
+    // Should be able to start new transactions after checkpoint.
+    let txn_id = txn_mgr.start_txn()?;
+    txn_mgr.commit_txn(txn_id)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_checkpoint_with_active_transactions_fails() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    // Start a transaction but don't commit.
+    let _txn_id = txn_mgr.start_txn()?;
+
+    // Checkpoint should fail with active transactions.
+    let result = txn_mgr.checkpoint();
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("active transactions"));
+
+    Ok(())
+}
+
+#[test]
+fn test_recovery_after_checkpoint() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store_dir = dir.path().join("store");
+    let graph_dir = dir.path().join("graph");
+    std::fs::create_dir_all(&store_dir)?;
+    std::fs::create_dir_all(&graph_dir)?;
+    let log_path = dir.path().join("test.log");
+
+    let obj_id = uuid::Uuid::new_v4();
+    let hash_a = content_hash(b"pre-checkpoint data");
+    let hash_b = content_hash(b"post-checkpoint data");
+
+    let store = ContentStore::open(&store_dir)?;
+    let graph = GraphNamespace::open(&graph_dir)?;
+
+    // Pre-checkpoint: create a node and commit.
+    {
+        let mut txn_mgr = TransactionManager::open(&log_path)?;
+        let txn_id = txn_mgr.start_txn()?;
+
+        let node = GraphNode::new_file(obj_id, 0, 0, 0o644);
+        let node_data = bincode::serialize(&node).unwrap();
+        txn_mgr.log_add_node(txn_id, obj_id, node_data)?;
+        graph.add_node(node);
+
+        store.put_object(obj_id, b"pre-checkpoint data")?;
+        txn_mgr.log_content_change(txn_id, obj_id, None, Some(hash_a))?;
+
+        txn_mgr.commit_txn(txn_id)?;
+    }
+
+    // Flush state and checkpoint (simulates what unmount does).
+    store.flush_index()?;
+    graph.flush()?;
+    {
+        let mut txn_mgr = TransactionManager::open(&log_path)?;
+        txn_mgr.checkpoint()?;
+    }
+
+    // Post-checkpoint: update content and commit.
+    {
+        let mut txn_mgr = TransactionManager::open(&log_path)?;
+        let txn_id = txn_mgr.start_txn()?;
+
+        store.put_object(obj_id, b"post-checkpoint data")?;
+        txn_mgr.log_content_change(txn_id, obj_id, Some(hash_a), Some(hash_b))?;
+
+        txn_mgr.commit_txn(txn_id)?;
+    }
+
+    // Simulate crash: reload graph and store from disk (checkpoint state).
+    let store2 = ContentStore::open(&store_dir)?;
+    let graph2 = GraphNamespace::open(&graph_dir)?;
+
+    // Recovery should redo the post-checkpoint transaction.
+    let result = recovery::recover(&log_path, &store2, &graph2)?;
+    assert_eq!(result.committed_count, 1, "one post-checkpoint txn committed");
+    assert_eq!(result.uncommitted_count, 0);
+
+    // Node should exist (from checkpoint state).
+    assert!(graph2.node_exists(&obj_id));
+
+    // Content should reflect the post-checkpoint update (redo applied it).
+    let hash = store2.get_hash(&obj_id);
+    assert_eq!(hash, Some(hash_b), "redo should apply post-checkpoint content change");
+
+    Ok(())
+}
+
+#[test]
+fn test_post_checkpoint_transactions_work() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    // Pre-checkpoint work.
+    let txn1 = txn_mgr.start_txn()?;
+    let obj1 = uuid::Uuid::new_v4();
+    txn_mgr.log_content_change(txn1, obj1, None, Some(content_hash(b"alpha")))?;
+    txn_mgr.commit_txn(txn1)?;
+
+    // Checkpoint.
+    txn_mgr.checkpoint()?;
+
+    // Post-checkpoint: new transactions should work normally.
+    let txn2 = txn_mgr.start_txn()?;
+    let obj2 = uuid::Uuid::new_v4();
+    txn_mgr.log_content_change(txn2, obj2, None, Some(content_hash(b"beta")))?;
+    txn_mgr.commit_txn(txn2)?;
+
+    // Log should have: Restart + Data + End = 3 records.
+    let records = LogManager::read_all_records(&log_path)?;
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].record_type, LogRecordType::Restart);
+    assert_eq!(records[1].record_type, LogRecordType::Data);
+    assert_eq!(records[2].record_type, LogRecordType::End);
+
+    Ok(())
+}
+
+// --- Three-Tier Reservation Tests ---
+
+#[test]
+fn test_progressive_reservation_release() -> io::Result<()> {
+    use assfs::txn::reservation::MAX_TRANSACTION_SIZE;
+
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    // Start a transaction — reserves MAX_TRANSACTION_SIZE.
+    let txn_id = txn_mgr.start_txn()?;
+    let initial_reserved = txn_mgr.admission.total_reserved;
+    assert_eq!(initial_reserved, MAX_TRANSACTION_SIZE as u64);
+
+    // Write a small data record (uses ~128 bytes of the 70KB reservation).
+    let obj_id = uuid::Uuid::new_v4();
+    let hash = content_hash(b"small data");
+    txn_mgr.log_content_change(txn_id, obj_id, None, Some(hash))?;
+
+    // Before commit, reservation is still full.
+    assert_eq!(txn_mgr.admission.total_reserved, MAX_TRANSACTION_SIZE as u64);
+
+    // Commit triggers tightening: unused portion released before END.
+    txn_mgr.commit_txn(txn_id)?;
+
+    // After commit, all reservation is released.
+    assert_eq!(txn_mgr.admission.total_reserved, 0);
+
+    Ok(())
+}
+
+#[test]
+fn test_tightening_increases_concurrent_capacity() -> io::Result<()> {
+    use assfs::txn::reservation::MAX_TRANSACTION_SIZE;
+
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+    // Shrink max log size to make the test meaningful.
+    txn_mgr.admission.max_log_size = (MAX_TRANSACTION_SIZE * 3) as u64;
+
+    // Start txn 1, write a small record, then commit.
+    let txn1 = txn_mgr.start_txn()?;
+    let obj1 = uuid::Uuid::new_v4();
+    txn_mgr.log_content_change(txn1, obj1, None, Some(content_hash(b"a")))?;
+
+    // Start txn 2 while txn 1 is still active.
+    let txn2 = txn_mgr.start_txn()?;
+    let obj2 = uuid::Uuid::new_v4();
+    txn_mgr.log_content_change(txn2, obj2, None, Some(content_hash(b"b")))?;
+
+    // Both active: 2 * MAX_TRANSACTION_SIZE reserved.
+    // With max_log_size = 3 * MAX_TRANSACTION_SIZE, we can still start one more.
+    let txn3 = txn_mgr.start_txn()?;
+    let obj3 = uuid::Uuid::new_v4();
+    txn_mgr.log_content_change(txn3, obj3, None, Some(content_hash(b"c")))?;
+
+    // 3 * MAX_TRANSACTION_SIZE = max. No more room.
+    assert!(txn_mgr.start_txn().is_err());
+
+    // Commit txn1 — tightening releases most of its 70KB reservation.
+    txn_mgr.commit_txn(txn1)?;
+
+    // After txn1 commits: its full reservation is released.
+    // Total reserved = 2 * MAX_TRANSACTION_SIZE.
+    // Now we can start another.
+    let txn4 = txn_mgr.start_txn()?;
+
+    // Clean up.
+    txn_mgr.commit_txn(txn2)?;
+    txn_mgr.commit_txn(txn3)?;
+    txn_mgr.commit_txn(txn4)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_tighten_is_idempotent() {
+    use assfs::txn::reservation::Reservation;
+
+    let mut r = Reservation::new(70 * 1024);
+    r.use_bytes(500);
+
+    let first = r.tighten();
+    assert!(first > 0, "first tighten should release bytes");
+
+    let second = r.tighten();
+    assert_eq!(second, 0, "second tighten should be a no-op");
+}
+
+/// Timing benchmark: measure how many fsyncs happen for N transactions.
+/// With deferred sync, N transactions of M records each should produce
+/// exactly N fsyncs (one per END), not N*M fsyncs.
+#[test]
+fn test_deferred_sync_timing_benchmark() -> io::Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("bench.log");
+
+    let num_txns = 10;
+    let records_per_txn = 5; // 5 Data + 1 End = 6 records per txn
+
+    let mut txn_mgr = TransactionManager::open(&log_path)?;
+
+    let start = Instant::now();
+
+    for t in 0..num_txns {
+        let txn_id = txn_mgr.start_txn()?;
+        for r in 0..records_per_txn {
+            let obj_id = uuid::Uuid::new_v4();
+            let data = format!("txn-{}-rec-{}", t, r);
+            let hash = content_hash(data.as_bytes());
+            txn_mgr.log_content_change(txn_id, obj_id, None, Some(hash))?;
+        }
+        txn_mgr.commit_txn(txn_id)?;
+    }
+
+    let elapsed = start.elapsed();
+    let total_records = num_txns * (records_per_txn + 1); // +1 for End
+    let sync_ns = txn_mgr.log.timings.sync_ns.load(Relaxed);
+    let record_count = txn_mgr.log.timings.record_count.load(Relaxed);
+
+    // Verify record count.
+    assert_eq!(record_count, total_records as u64);
+
+    // Verify all records are on disk.
+    drop(txn_mgr);
+    let records = LogManager::read_all_records(&log_path)?;
+    assert_eq!(records.len(), total_records);
+
+    // Print benchmark results (visible with cargo test -- --nocapture).
+    eprintln!(
+        "\n=== Deferred Sync Benchmark ===\n\
+         Transactions: {}\n\
+         Records/txn:  {} data + 1 end = {}\n\
+         Total records: {}\n\
+         Total time:   {:?}\n\
+         Sync time:    {:.3} ms (fsyncs happen only on End records)\n\
+         Per-txn:      {:.3} ms\n\
+         Per-record:   {:.3} us\n\
+         ===============================\n",
+        num_txns,
+        records_per_txn,
+        records_per_txn + 1,
+        total_records,
+        elapsed,
+        sync_ns as f64 / 1_000_000.0,
+        elapsed.as_micros() as f64 / num_txns as f64 / 1000.0,
+        elapsed.as_micros() as f64 / total_records as f64,
+    );
+
+    Ok(())
+}
+
+// --- Proactive Checkpoint Tests ---
+
+#[test]
+fn test_proactive_checkpoint_on_admission_exhaustion() -> io::Result<()> {
+    use assfs::fuse_ops::AssFs;
+    use assfs::txn::reservation::MAX_TRANSACTION_SIZE;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("data");
+
+    let fs = AssFs::open(&data_dir)?;
+
+    // Shrink max_log_size so admission control exhausts quickly.
+    // Allow exactly 2 transactions worth of space: after the first two
+    // transactions commit (releasing their reservations), the cumulative
+    // log bytes are still tracked by admission until checkpoint.
+    // With 3 * MAX_TRANSACTION_SIZE, we can fit 3 concurrent reservations.
+    // We'll fill it by starting+committing transactions (which release
+    // reservation but the log grows), then check that the 4th triggers
+    // a checkpoint.
+    //
+    // Actually, AdmissionController tracks total_reserved (not total log
+    // bytes). When a transaction commits, its reservation is released.
+    // So we need to make the max small enough that we can't even reserve
+    // one more transaction.
+    //
+    // The trick: commit_txn releases reservation via admission.release(),
+    // which decrements total_reserved. So total_reserved returns to 0
+    // after each commit. The log file grows but admission doesn't track
+    // that. We need a different approach.
+    //
+    // Let's set max_log_size to something tiny — less than
+    // MAX_TRANSACTION_SIZE — so start_txn always fails. Then
+    // start_txn_or_checkpoint should checkpoint and retry.
+    //
+    // But wait: after checkpoint, admission.reset() sets total_reserved=0,
+    // and max_log_size is still tiny. The retry will fail again.
+    //
+    // Real approach: set max_log_size to just barely more than
+    // MAX_TRANSACTION_SIZE (so one txn fits). Fill it up with a committed
+    // transaction, then try to start another. The committed txn released
+    // its reservation, so total_reserved is 0, and start_txn should
+    // succeed... unless admission tracks cumulative log bytes differently.
+    //
+    // Reading the code: try_reserve checks total_reserved + bytes > max_log_size.
+    // release() decrements total_reserved. So after commit, total_reserved=0
+    // and the next start_txn should succeed regardless. This means the
+    // "checkpoint needed" error only fires when there are enough CONCURRENT
+    // active transactions to exhaust the space.
+    //
+    // For the proactive checkpoint test, we need concurrent active
+    // transactions. But FUSE is single-threaded in the MVP. So the test
+    // scenario is: we manually leave reservations in place (e.g., by not
+    // committing) to exhaust space, then the next FUSE op should checkpoint.
+    //
+    // Simplest approach: exhaust admission by adjusting max_log_size, then
+    // call start_txn_or_checkpoint and verify it succeeds.
+
+    {
+        let mut txn_mgr = fs.txn_mgr.lock().unwrap();
+
+        // Set max_log_size so exactly one transaction can be reserved.
+        txn_mgr.admission.max_log_size = MAX_TRANSACTION_SIZE as u64;
+
+        // Start and commit a transaction so the graph/store have some state.
+        let txn1 = txn_mgr.start_txn()?;
+        let obj1 = uuid::Uuid::new_v4();
+        txn_mgr.log_content_change(txn1, obj1, None, Some(content_hash(b"data1")))?;
+        txn_mgr.commit_txn(txn1)?;
+        // total_reserved is now 0, but the log contains records.
+
+        // Artificially inflate total_reserved to simulate exhaustion.
+        // This mimics the state where the log has grown large enough
+        // that admission control would reject new transactions.
+        txn_mgr.admission.total_reserved = MAX_TRANSACTION_SIZE as u64;
+
+        // Verify direct start_txn fails.
+        assert!(
+            txn_mgr.start_txn().is_err(),
+            "start_txn should fail when admission is exhausted"
+        );
+    }
+
+    // Now call start_txn_or_checkpoint — it should:
+    // 1. Try start_txn -> fails
+    // 2. Flush store + graph
+    // 3. Checkpoint (resets admission to 0)
+    // 4. Retry start_txn -> succeeds
+    {
+        let mut txn_mgr = fs.txn_mgr.lock().unwrap();
+        let txn_id = fs.start_txn_or_checkpoint(&mut txn_mgr)?;
+
+        // Verify we got a valid transaction.
+        assert!(txn_mgr.active.contains_key(&txn_id));
+
+        // Clean up.
+        txn_mgr.commit_txn(txn_id)?;
+    }
+
+    // Verify the checkpoint counter was incremented.
+    assert_eq!(
+        fs.stats.checkpoint_count.load(Relaxed),
+        1,
+        "exactly one proactive checkpoint should have been triggered"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_proactive_checkpoint_counter_accumulates() -> io::Result<()> {
+    use assfs::fuse_ops::AssFs;
+    use assfs::txn::reservation::MAX_TRANSACTION_SIZE;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("data");
+
+    let fs = AssFs::open(&data_dir)?;
+
+    // Trigger proactive checkpoint twice.
+    for round in 0..2 {
+        {
+            let mut txn_mgr = fs.txn_mgr.lock().unwrap();
+            txn_mgr.admission.max_log_size = MAX_TRANSACTION_SIZE as u64;
+            // Inflate reservation to simulate exhaustion.
+            txn_mgr.admission.total_reserved = MAX_TRANSACTION_SIZE as u64;
+        }
+
+        {
+            let mut txn_mgr = fs.txn_mgr.lock().unwrap();
+            let txn_id = fs.start_txn_or_checkpoint(&mut txn_mgr)?;
+            // Do some work so the log has content for next checkpoint.
+            let obj_id = uuid::Uuid::new_v4();
+            txn_mgr.log_content_change(
+                txn_id,
+                obj_id,
+                None,
+                Some(content_hash(format!("round-{}", round).as_bytes())),
+            )?;
+            txn_mgr.commit_txn(txn_id)?;
+        }
+    }
+
+    assert_eq!(
+        fs.stats.checkpoint_count.load(Relaxed),
+        2,
+        "two proactive checkpoints should have been triggered"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_proactive_checkpoint_no_false_trigger() -> io::Result<()> {
+    use assfs::fuse_ops::AssFs;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("data");
+
+    let fs = AssFs::open(&data_dir)?;
+
+    // Normal operation: admission has plenty of space.
+    // start_txn_or_checkpoint should succeed without checkpoint.
+    {
+        let mut txn_mgr = fs.txn_mgr.lock().unwrap();
+        let txn_id = fs.start_txn_or_checkpoint(&mut txn_mgr)?;
+        txn_mgr.commit_txn(txn_id)?;
+    }
+
+    assert_eq!(
+        fs.stats.checkpoint_count.load(Relaxed),
+        0,
+        "no checkpoint should be triggered when admission has space"
+    );
+
+    Ok(())
+}

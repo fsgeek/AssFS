@@ -21,7 +21,7 @@ use crate::store::content::ContentStore;
 use crate::txn::recovery;
 use crate::txn::tlock::TlockTable;
 use crate::txn::transaction::TransactionManager;
-use crate::{EdgeType, NodeType, ObjectId, EMPTY_HASH};
+use crate::{EdgeType, NodeType, ObjectId, TransactionId, EMPTY_HASH};
 
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -156,6 +156,39 @@ impl AssFs {
         self.store.flush_index()?;
         self.graph.flush()?;
         Ok(())
+    }
+
+    /// Start a transaction, performing a proactive checkpoint if admission
+    /// control rejects the request due to log space exhaustion.
+    ///
+    /// Episode insight: checkpoint is NOT an error — it's a normal lifecycle
+    /// event. The FUSE layer should handle it transparently rather than
+    /// propagating ENOSPC to the caller.
+    ///
+    /// Precondition: `txn_mgr` must have no active transactions for
+    /// checkpoint to succeed (single-threaded FUSE guarantees this).
+    pub fn start_txn_or_checkpoint(
+        &self,
+        txn_mgr: &mut TransactionManager,
+    ) -> io::Result<TransactionId> {
+        match txn_mgr.start_txn() {
+            Ok(id) => {
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                Ok(id)
+            }
+            Err(_) => {
+                // Admission control rejected: log space exhausted.
+                // Flush durable state, checkpoint, and retry.
+                log::info!("Admission control full, triggering proactive checkpoint");
+                self.store.flush_index()?;
+                self.graph.flush()?;
+                txn_mgr.checkpoint()?;
+                self.stats.checkpoint_count.fetch_add(1, Relaxed);
+                let id = txn_mgr.start_txn()?;
+                self.stats.txn_started.fetch_add(1, Relaxed);
+                Ok(id)
+            }
+        }
     }
 
     /// Convert a GraphNode to FUSE FileAttr.
@@ -390,14 +423,11 @@ impl Filesystem for AssFs {
             return;
         }
 
-        // 1. Start transaction (brief lock).
+        // 1. Start transaction (brief lock, with proactive checkpoint).
         let txn_id = {
             let mut txn_mgr = self.txn_mgr.lock().unwrap();
-            match txn_mgr.start_txn() {
-                Ok(id) => {
-                    self.stats.txn_started.fetch_add(1, Relaxed);
-                    id
-                }
+            match self.start_txn_or_checkpoint(&mut txn_mgr) {
+                Ok(id) => id,
                 Err(_) => {
                     reply.error(libc::ENOSPC);
                     return;
@@ -527,16 +557,18 @@ impl Filesystem for AssFs {
         }
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
-        let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => {
-                self.stats.txn_started.fetch_add(1, Relaxed);
-                id
-            }
+        let txn_id = match self.start_txn_or_checkpoint(&mut txn_mgr) {
+            Ok(id) => id,
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
             }
         };
+
+        // Touch tlock on parent directory (EC merge trigger under concurrency).
+        if let Some(other) = self.tlocks.touch(parent_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
 
         let dir_id = uuid::Uuid::new_v4();
         let dir_node = GraphNode::new_dir(dir_id, req.uid(), req.gid(), mode);
@@ -630,16 +662,21 @@ impl Filesystem for AssFs {
         }
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
-        let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => {
-                self.stats.txn_started.fetch_add(1, Relaxed);
-                id
-            }
+        let txn_id = match self.start_txn_or_checkpoint(&mut txn_mgr) {
+            Ok(id) => id,
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
             }
         };
+
+        // Touch tlocks on parent directory and target file.
+        if let Some(other) = self.tlocks.touch(parent_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
+        if let Some(other) = self.tlocks.touch(target_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
 
         // Capture node data for potential undo before removing anything.
         let target_node_data = self
@@ -750,16 +787,21 @@ impl Filesystem for AssFs {
         }
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
-        let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => {
-                self.stats.txn_started.fetch_add(1, Relaxed);
-                id
-            }
+        let txn_id = match self.start_txn_or_checkpoint(&mut txn_mgr) {
+            Ok(id) => id,
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
             }
         };
+
+        // Touch tlocks on parent directory and target directory.
+        if let Some(other) = self.tlocks.touch(parent_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
+        if let Some(other) = self.tlocks.touch(target_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
 
         // Capture node data for undo before removing.
         let target_node_data = self
@@ -949,11 +991,8 @@ impl Filesystem for AssFs {
         content[offset..end].copy_from_slice(data);
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
-        let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => {
-                self.stats.txn_started.fetch_add(1, Relaxed);
-                id
-            }
+        let txn_id = match self.start_txn_or_checkpoint(&mut txn_mgr) {
+            Ok(id) => id,
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
@@ -1076,16 +1115,21 @@ impl Filesystem for AssFs {
         }
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
-        let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => {
-                self.stats.txn_started.fetch_add(1, Relaxed);
-                id
-            }
+        let txn_id = match self.start_txn_or_checkpoint(&mut txn_mgr) {
+            Ok(id) => id,
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
             }
         };
+
+        // Touch tlocks on parent directory and target file.
+        if let Some(other) = self.tlocks.touch(parent_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
+        if let Some(other) = self.tlocks.touch(target_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
 
         // Log the edge addition — this is the associative property.
         if txn_mgr
@@ -1192,16 +1236,27 @@ impl Filesystem for AssFs {
         };
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
-        let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => {
-                self.stats.txn_started.fetch_add(1, Relaxed);
-                id
-            }
+        let txn_id = match self.start_txn_or_checkpoint(&mut txn_mgr) {
+            Ok(id) => id,
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
             }
         };
+
+        // Touch tlocks: source dir, target dir, source object.
+        // Rename is the hottest op for EC merge — up to 4 objects locked.
+        if let Some(other) = self.tlocks.touch(old_parent_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
+        if old_parent_id != new_parent_id {
+            if let Some(other) = self.tlocks.touch(new_parent_id, txn_id) {
+                txn_mgr.ec_merge(txn_id, other);
+            }
+        }
+        if let Some(other) = self.tlocks.touch(target_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
 
         // If destination exists, remove it inside the transaction.
         if let Some(existing_id) =
@@ -1415,16 +1470,18 @@ impl Filesystem for AssFs {
         }
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
-        let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => {
-                self.stats.txn_started.fetch_add(1, Relaxed);
-                id
-            }
+        let txn_id = match self.start_txn_or_checkpoint(&mut txn_mgr) {
+            Ok(id) => id,
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
             }
         };
+
+        // Touch tlock on the tagged object (tag mutation).
+        if let Some(other) = self.tlocks.touch(obj_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
 
         // Find or create the tag anchor node.
         let anchor_id = if let Some(id) =
@@ -1660,16 +1717,18 @@ impl Filesystem for AssFs {
         };
 
         let mut txn_mgr = self.txn_mgr.lock().unwrap();
-        let txn_id = match txn_mgr.start_txn() {
-            Ok(id) => {
-                self.stats.txn_started.fetch_add(1, Relaxed);
-                id
-            }
+        let txn_id = match self.start_txn_or_checkpoint(&mut txn_mgr) {
+            Ok(id) => id,
             Err(_) => {
                 reply.error(libc::ENOSPC);
                 return;
             }
         };
+
+        // Touch tlock on the object being untagged.
+        if let Some(other) = self.tlocks.touch(obj_id, txn_id) {
+            txn_mgr.ec_merge(txn_id, other);
+        }
 
         if txn_mgr
             .log_remove_edge(
@@ -1703,16 +1762,23 @@ impl Filesystem for AssFs {
 
     fn destroy(&mut self) {
         log::info!("AssFS: unmounting, flushing state...");
+        // Checkpoint: flush all state, then truncate the log.
+        // This reclaims log space and ensures a clean restart.
         if let Err(e) = self.flush_all() {
             log::error!("Error flushing state on unmount: {}", e);
         }
         {
-            let txn_mgr = self.txn_mgr.lock().unwrap();
+            let mut txn_mgr = self.txn_mgr.lock().unwrap();
+            // Capture stats BEFORE checkpoint truncates the log timing data.
             self.stats.print_summary(Some(&txn_mgr.log.timings));
             if let Some(ref path) = self.stats_file {
                 if let Err(e) = self.stats.write_json(path, Some(&txn_mgr.log.timings)) {
                     log::error!("Error writing stats file: {}", e);
                 }
+            }
+            // Truncate log and reset admission control.
+            if let Err(e) = txn_mgr.checkpoint() {
+                log::error!("Error during checkpoint on unmount: {}", e);
             }
         }
         // Directory mutation frequency distribution.

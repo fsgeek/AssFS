@@ -1,4 +1,4 @@
-//! Log manager — sequential append log with sync writes.
+//! Log manager — sequential append log with deferred sync.
 //!
 //! Every mutation (content change, graph node add/remove, graph edge
 //! add/remove) is logged with enough old/new state to undo and redo.
@@ -6,6 +6,19 @@
 //! Episode lesson (via Mike Young / Camelot): old+new value logging means
 //! metadata can be written before transaction commits — undo is the safety
 //! net, not a gate.
+//!
+//! **Deferred sync**: Data and BatchEnd records are buffered without fsync.
+//! Only commit-point records (End, Checkpoint, Restart) trigger flush+sync,
+//! which makes ALL preceding buffered records durable in a single fsync.
+//! This is safe because:
+//! - If Data records are lost (crash before END sync), the transaction has
+//!   no END record, so recovery treats it as uncommitted.
+//! - There's nothing to undo because the Data records are also gone.
+//! - Content writes (STEAL mode) create new immutable blobs that become
+//!   orphans if the transaction never commits — no corruption.
+//!
+//! The `io_window` field tracks the highest LSN known to be on stable
+//! storage. All records with LSN <= io_window are durable.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
@@ -118,6 +131,9 @@ pub struct LogManager {
     pub timings: LogTimings,
     /// When true, skip fsync on every record (unsafe, for measurement only).
     pub no_sync: bool,
+    /// Highest LSN known to be on stable storage (durable after fsync).
+    /// All records with LSN <= io_window are guaranteed durable.
+    io_window: LogSequenceNumber,
 }
 
 impl LogManager {
@@ -142,6 +158,7 @@ impl LogManager {
             next_lsn,
             timings: LogTimings::new(),
             no_sync: false,
+            io_window: if next_lsn > 1 { next_lsn - 1 } else { 0 },
         })
     }
 
@@ -203,10 +220,25 @@ impl LogManager {
         })
     }
 
-    /// Append a record, sync to disk, return its LSN.
+    /// Append a record, return its LSN.
+    ///
+    /// **Deferred sync**: Only commit-point records (End, Checkpoint, Restart)
+    /// trigger flush+sync. Data and BatchEnd records are buffered in the
+    /// BufWriter without fsync. The commit-point sync makes ALL preceding
+    /// buffered records durable in a single fsync call.
+    ///
+    /// This is safe because of old/new value logging: if buffered Data
+    /// records are lost in a crash, the transaction has no END record on
+    /// disk, so recovery treats it as uncommitted with nothing to undo.
     fn append(&mut self, record: LogRecord) -> io::Result<LogSequenceNumber> {
         let lsn = record.lsn;
         let r = Ordering::Relaxed;
+
+        // Commit-point records require durable sync.
+        let needs_sync = matches!(
+            record.record_type,
+            LogRecordType::End | LogRecordType::Checkpoint | LogRecordType::Restart
+        );
 
         // Phase 1: Serialize.
         let t0 = Instant::now();
@@ -215,25 +247,78 @@ impl LogManager {
         let len = record_bytes.len() as u32;
         self.timings.serialize_ns.fetch_add(t0.elapsed().as_nanos() as u64, r);
 
-        // Phase 2: Write to buffer + flush.
+        // Phase 2: Write to buffer.
         let t1 = Instant::now();
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&record_bytes)?;
-        self.writer.flush()?;
         self.timings.write_ns.fetch_add(t1.elapsed().as_nanos() as u64, r);
 
-        // Phase 3: Sync to stable storage (commit point for End records).
-        let t2 = Instant::now();
-        if !self.no_sync {
-            self.writer.get_ref().sync_all()?;
+        // Phase 3: Flush + sync only for commit-point records.
+        // The flush() pushes all buffered data (including prior Data records)
+        // to the kernel, and sync_all() forces it to stable storage.
+        if needs_sync {
+            let t2 = Instant::now();
+            self.writer.flush()?;
+            if !self.no_sync {
+                self.writer.get_ref().sync_all()?;
+            }
+            self.timings.sync_ns.fetch_add(t2.elapsed().as_nanos() as u64, r);
+            self.io_window = lsn;
         }
-        self.timings.sync_ns.fetch_add(t2.elapsed().as_nanos() as u64, r);
 
         self.timings.record_count.fetch_add(1, r);
         self.timings.record_bytes.fetch_add(record_bytes.len() as u64, r);
 
         self.next_lsn += 1;
         Ok(lsn)
+    }
+
+    /// The highest LSN known to be on stable storage.
+    /// Records with LSN <= io_window are durable. Records above io_window
+    /// may be in the BufWriter or kernel buffer but not yet fsynced.
+    pub fn io_window(&self) -> LogSequenceNumber {
+        self.io_window
+    }
+
+    /// Flush all buffered records to stable storage.
+    /// Use this for clean shutdown or explicit sync points.
+    pub fn sync_pending(&mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        if !self.no_sync {
+            self.writer.get_ref().sync_all()?;
+        }
+        // io_window advances to cover everything written so far.
+        if self.next_lsn > 1 {
+            self.io_window = self.next_lsn - 1;
+        }
+        Ok(())
+    }
+
+    /// Truncate the log and write a restart sentinel.
+    ///
+    /// Called during checkpoint after all state (graph, content index) has
+    /// been flushed to disk. The log can be safely discarded because:
+    /// - All committed transactions are reflected in the flushed state.
+    /// - No active transactions exist (caller asserts this).
+    /// - Recovery after a post-checkpoint crash loads the flushed state
+    ///   and replays only post-checkpoint log records.
+    pub fn truncate_and_restart(&mut self) -> io::Result<()> {
+        // Flush any pending data in the buffer first.
+        self.writer.flush()?;
+
+        // Truncate the log file to zero length.
+        self.writer.get_ref().set_len(0)?;
+
+        // Write a restart sentinel. This is a commit-point record,
+        // so it triggers flush+sync, making the truncation durable.
+        self.log_restart()?;
+
+        log::info!(
+            "Log truncated and restarted at LSN {}",
+            self.next_lsn - 1
+        );
+
+        Ok(())
     }
 
     /// Read all records from the log file (for recovery).
