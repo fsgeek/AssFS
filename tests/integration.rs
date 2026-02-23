@@ -1964,3 +1964,180 @@ fn test_proactive_checkpoint_no_false_trigger() -> io::Result<()> {
 
     Ok(())
 }
+
+// --- Background Sync Thread Tests ---
+
+#[test]
+fn test_sync_thread_starts_and_stops() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut log = LogManager::open(&log_path)?;
+    assert!(!log.has_sync_thread());
+
+    log.start_sync_thread(std::time::Duration::from_millis(10))?;
+    assert!(log.has_sync_thread());
+
+    log.stop_sync_thread()?;
+    assert!(!log.has_sync_thread());
+
+    Ok(())
+}
+
+#[test]
+fn test_sync_thread_advances_io_window() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let obj_id = uuid::Uuid::new_v4();
+    let hash = content_hash(b"sync-thread-test");
+
+    let mut log = LogManager::open(&log_path)?;
+    log.start_sync_thread(std::time::Duration::from_millis(10))?;
+
+    assert_eq!(log.io_window(), 0);
+
+    // Write data record — no sync.
+    log.log_data(1, LogPayload::ContentChange {
+        object_id: obj_id,
+        old_hash: None,
+        new_hash: Some(hash),
+    })?;
+    assert_eq!(log.io_window(), 0, "Data record must not advance io_window");
+
+    // Write End record — with sync thread, this only flushes to kernel.
+    let end_lsn = log.log_end(1)?;
+
+    // io_window may not advance immediately (async). Wait for the sync thread.
+    let state = log.sync_state();
+    let durable = state.wait_for_durable(end_lsn, std::time::Duration::from_secs(2));
+    assert!(durable, "sync thread should make End record durable within 2s");
+    assert!(log.io_window() >= end_lsn);
+
+    log.stop_sync_thread()?;
+
+    // Records should be recoverable.
+    drop(log);
+    let records = LogManager::read_all_records(&log_path)?;
+    assert_eq!(records.len(), 2);
+
+    Ok(())
+}
+
+#[test]
+fn test_sync_thread_batches_multiple_ends() -> io::Result<()> {
+    // With the sync thread, multiple End records written in quick succession
+    // should be covered by fewer fsyncs than one-per-End.
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut log = LogManager::open(&log_path)?;
+    // Use a longer interval to increase batching.
+    log.start_sync_thread(std::time::Duration::from_millis(100))?;
+
+    // Write 10 transactions as fast as possible.
+    let mut last_lsn = 0;
+    for txn_id in 1..=10u64 {
+        let obj_id = uuid::Uuid::new_v4();
+        log.log_data(txn_id, LogPayload::ContentChange {
+            object_id: obj_id,
+            old_hash: None,
+            new_hash: Some(content_hash(format!("batch-{}", txn_id).as_bytes())),
+        })?;
+        last_lsn = log.log_end(txn_id)?;
+    }
+
+    // Wait for all to become durable.
+    let state = log.sync_state();
+    let durable = state.wait_for_durable(last_lsn, std::time::Duration::from_secs(2));
+    assert!(durable, "all records should become durable");
+
+    // With sync thread, the sync_ns should be less than if each End
+    // synced individually, but we can't easily measure the fsync count.
+    // At minimum, verify all records are durable and recoverable.
+    let sync_ns = log.timings.sync_ns.load(Relaxed);
+    eprintln!(
+        "Batched sync: 10 transactions, sync_ns = {} (expected less than 10 individual fsyncs)",
+        sync_ns
+    );
+
+    log.stop_sync_thread()?;
+
+    // Verify all records on disk.
+    drop(log);
+    let records = LogManager::read_all_records(&log_path)?;
+    assert_eq!(records.len(), 20, "10 Data + 10 End records");
+
+    Ok(())
+}
+
+#[test]
+fn test_sync_thread_wait_for_durable_timeout() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let log = LogManager::open(&log_path)?;
+
+    // Don't start sync thread. wait_for_durable on a future LSN should timeout.
+    let state = log.sync_state();
+    let durable = state.wait_for_durable(999, std::time::Duration::from_millis(50));
+    assert!(!durable, "should timeout when no sync thread and LSN not durable");
+
+    Ok(())
+}
+
+#[test]
+fn test_sync_thread_checkpoint_still_synchronous() -> io::Result<()> {
+    // Checkpoint records must sync immediately even with sync thread running.
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut log = LogManager::open(&log_path)?;
+    log.start_sync_thread(std::time::Duration::from_millis(100))?;
+
+    let ckpt_lsn = log.log_checkpoint()?;
+
+    // Checkpoint should be immediately durable — no waiting needed.
+    assert!(
+        log.io_window() >= ckpt_lsn,
+        "Checkpoint must be immediately durable even with sync thread"
+    );
+
+    log.stop_sync_thread()?;
+    Ok(())
+}
+
+#[test]
+fn test_sync_thread_clean_shutdown_no_data_loss() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_path = dir.path().join("test.log");
+
+    let mut log = LogManager::open(&log_path)?;
+    log.start_sync_thread(std::time::Duration::from_millis(50))?;
+
+    // Write several transactions.
+    for txn_id in 1..=5u64 {
+        let obj_id = uuid::Uuid::new_v4();
+        log.log_data(txn_id, LogPayload::ContentChange {
+            object_id: obj_id,
+            old_hash: None,
+            new_hash: Some(content_hash(format!("shutdown-{}", txn_id).as_bytes())),
+        })?;
+        log.log_end(txn_id)?;
+    }
+
+    // Stop sync thread — should perform final sync.
+    log.stop_sync_thread()?;
+
+    // After shutdown, io_window should cover everything.
+    assert!(log.io_window() >= log.next_lsn() - 1);
+
+    // All records should be recoverable.
+    drop(log);
+    let records = LogManager::read_all_records(&log_path)?;
+    assert_eq!(records.len(), 10, "5 Data + 5 End records after clean shutdown");
+
+    Ok(())
+}
