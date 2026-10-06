@@ -213,3 +213,27 @@ counterexample or a hollow pass that was inspected before trusting it):
 shutdown not distinguished from crash; a frame condition that disabled
 Submit (22-state "pass"); checkpoint/restart pages exempted from the
 chain; the tail's own back-link checked against an overwritten slot.
+
+## TornPage.tla — torn page writes vs. redo style
+
+A page is a header sector (page LSN) plus data sectors; a page write lands
+sector by sector, in any order. Single-record committing transactions,
+WAL, any durable log prefix.
+
+| cfg | redo | writes | result |
+|---|---|---|---|
+| torn-phys | physical old/new (Episode): set range to new bytes | can tear | passes (2,419 states) |
+| torn-delta | "add 1", applied only if media page LSN is older | can tear | **Correct fails**: header sector lands, data sector doesn't; redo skipped |
+| atomic-delta | same | atomic | passes (control) |
+
+12. **Physical byte-range logging tolerates torn pages; LSN-gated delta
+    redo does not.** Physical redo never consults the page, so any mix of
+    old and new sectors converges — provided every change to the page is
+    logged. That is why Episode needed no doublewrite buffer and why a
+    physiological log (PostgreSQL) needs full_page_writes.
+    Undo-zero under torn data writes, by argument only: Z ends after the
+    data write *completes* (all sectors, on the 1992 contract), and undo
+    zeroes the whole range regardless of which sectors landed.
+    Caveat for a modern design: a per-page checksum (finding 4) will fail
+    on a torn page *before* redo repairs it, so recovery must redo first
+    and verify after, for pages the log covers.
