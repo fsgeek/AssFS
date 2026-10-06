@@ -237,3 +237,29 @@ WAL, any durable log prefix.
     Caveat for a modern design: a per-page checksum (finding 4) will fail
     on a torn page *before* redo repairs it, so recovery must redo first
     and verify after, for pages the log covers.
+
+## The B_ASYNC comment (vnops/efs_newalloc.c) — code reading, no model
+
+The comment above efs_ZeroBytes: B_ASYNC is safe only if epia_Strategy
+checks the pending-blocks list and waits on/sets INTRANSIT for every block
+it writes.
+
+13. **The stated precondition holds, and the call site doesn't rely on
+    it.** anode/strategy.c epia_MarkInTransit does exactly that: for each
+    block, wait while BUSY, then mark BUSY on writes; epia_ClearInTransit
+    clears at iodone. And efs_ZeroBytes → efs_PutContentsNoVM is
+    synchronous anyway (epia_BioWait; B_ASYNC never set).
+    The assumptions moved one level down, and MarkInTransit states them:
+    - "only one thread will find itself waiting for a particular
+      in-transit disk block" — **asserted** (a second waiter panics:
+      fail-stop);
+    - "the blocks associated with this buf will not become in transit
+      as a result of concurrent activities by other threads ... The
+      higher-level vnode locking should guarantee this" — **not
+      asserted**. For writes it is moot (the block is marked BUSY right
+      after the wait). For reads it is load-bearing: a reader waits for
+      block d, does not mark it, moves on, and d can enter transit again
+      before the read is issued.
+    Whether every epia_Strategy caller holds the vnode lock is a
+    call-graph audit (VM paging vs. promotion/allocation/volume ops),
+    not a model-checking question. Not done.
