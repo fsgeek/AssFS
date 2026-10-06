@@ -134,3 +134,82 @@ a class's units are released when it commits.
    but necessary to cascade UndoZero transactions") is exactly the
    exception to this argument, guarded by the caller's promise about
    combined size.
+
+## WrapLog.tla — the circular log across mounts
+
+Mount as elbl_Init/elbr_GetCleanLogInfo: slot 0 starting with a RESTART
+record means clean; passno = IncPassno(restart pass) and writing restarts
+at slot 0. Otherwise SafeDumpLog (binary search on masked pass distance,
+window check in distance form, scan tail..head), then a checkpoint block
+after the head and a restart block with pass + 2. Write-through device,
+out-of-order completion, crashes anywhere. Ghost fields record each
+page's mount incarnation.
+
+| cfg | pass bits | mounts | FIX | result |
+|---|---|---|---|---|
+| wrap-asis | 4 | 3 | no | **NoSilentError fails**: two incarnations' logs replayed as one |
+| wrap-fix | 4 | 3 | yes | passes (3,362 states) |
+| wrap-fix-long | 3 | 5 | yes | NoSalvage fails: pass-number aliasing (see 9) |
+
+8. **Pass number reuse after a crash on a clean mount.** Mount 1 reads
+   restart pass R, writes pass R+1 from slot 0; slot 1 lands before slot
+   0; crash. Nothing was acknowledged and slot 0 still holds the clean
+   restart record, so mount 2 skips recovery — correctly — and starts
+   pass R+1 *again*. Its slot 0 lands; crash before its slot 1 does.
+   Media: slot 0 = mount 2's page, slot 1 = mount 1's page, same pass,
+   valid checksum. Recovery accepts both: a silent splice of two
+   histories. The recovery path's "+2 ... paranoia" bump (recover.c,
+   elbr_Recover step 5) shows the hazard was anticipated; the clean-mount
+   path has no bump. FIX: persist the new pass (rewrite the restart
+   block) before writing any page with it. Same reordering caveat as 1.
+
+9. **Masked pass comparison assumes all pages are within half the pass
+   range.** Restarting at slot 0 on every mount leaves slots beyond short
+   incarnations unrewritten, holding old pass numbers while the counter
+   advances (+1 per clean mount, +3 per recover-and-mount). With a 3-bit
+   field the model aliases within five mounts and the binary search reads
+   an old page as newer. With the real 16-bit field this needs on the
+   order of 10^4 mounts with some slot never rewritten — rare in
+   production, plausible under crash-test harnesses. Not reproducible at
+   W = 16 by model checking; stated as an argument, not a result.
+
+## WrapResume.tla — resume after the recovered head
+
+Tony's alternative: resume writing after the recovery point instead of
+restarting at slot 0. Clean shutdown writes its restart record as the
+next page in sequence; every mount runs the head search. Options: CHAIN
+(each page names its predecessor) and SCRUB (at mount, durably overwrite
+the IOMAX slots after the head with filler pages carrying the previous
+pass). IOMAX bounds the io_window *distance* in the writer.
+
+| cfg | N | pass bits | mounts | option | result |
+|---|---|---|---|---|---|
+| resume | 4 | 4 | 3 | none | **NoSilentError fails**: stale page, same (slot, pass), read as newer than the restart record |
+| resume-chain | 4 | 4 | 3 | CHAIN | passes (7,960 states) |
+| resume-chain-long | 4 | 3 | 5 | CHAIN | NoSalvage fails (not diagnosed; superseded) |
+| resume-noscrub5 | 5 | 4 | 3 | none | NoSilentError fails |
+| resume-scrub | 5 | 4 | 3 | SCRUB | passes (5,390 states) |
+| resume-scrub-long | 5 | 3 | 5 | SCRUB | passes (73,947 states) |
+
+10. **A finite pass number suffices if nothing stale stays visible**
+    (Tony: with a bounded log there is a generation width that is never
+    *visibly* reused). Episode's steady state has that property; the
+    mount path broke it twice — restarting at slot 0 (unbounded
+    lifetime for unrewritten slots, finding 9) and reusing names of a
+    crashed run's pages ahead of the head (finding 8). The design that
+    passes even with a 3-bit pass field: (a) resume after the head, so
+    every slot rotates; (b) the writer bounds the distance to the oldest
+    unfinished page; (c) mount durably overwrites that many slots ahead
+    before writing. No chain, no persisted bump.
+
+11. **Count vs distance, again.** Bounding the *number* of pages in flight
+    is not enough: with one page stuck in flight, later pages keep
+    completing, and a stale page sat three slots past the head with only
+    two ever in flight. io_window must be a distance everywhere — the
+    header, the writer's limit, and the mount-time scrub.
+
+Model errors found and fixed during this section (each produced a
+counterexample or a hollow pass that was inspected before trusting it):
+shutdown not distinguished from crash; a frame condition that disabled
+Submit (22-state "pass"); checkpoint/restart pages exempted from the
+chain; the tail's own back-link checked against an overwritten slot.
