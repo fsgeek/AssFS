@@ -1,9 +1,70 @@
-# Specs
+# Episode's log and recovery, model-checked
 
-TLA+ models of Episode-style logging over modern device contracts.
-Checked with TLC (2 pages, 2 transactions, 1 update each).
+TLA+ models of the Episode file system's transaction log and recovery
+(Transarc, 1991–96; source in `dce/dce/src/file/episode/logbuf`), checked
+against two device contracts: the 1992 one (a completed write is on
+media) and NVMe with a volatile write cache (a completed write is durable
+only after a flush issued after it completed).
+
+**Method.** Each mechanism is modelled from the code as written, not from
+the design intent — the gap between the two is where the bugs were. Every
+model is paired with deliberately broken variants that must fail, so a
+pass means something. Crashes are not modelled as an action where it can
+be avoided: the invariant asks "if power failed in this state, would
+recovery be right?" in every reachable state. Bounds are small (2–3
+transactions, 2–5 pages or log slots) and stated per table.
 
 Run: `java -cp tla2tools.jar tlc2.TLC -deadlock -config <cfg> <module>.tla`
+(ECDrain without `-deadlock`: deadlock is one of its results).
+
+## Summary
+
+**Bugs in the code as written**
+
+| # | What | Consequence |
+|---|---|---|
+| 1 | `io_window` stores a count of in-transit pages; recovery reads it as a distance | spurious salvage when log pages complete out of order |
+| 8 | A crash right after a clean mount leaves pages whose pass number the next mount reuses | **silent**: two runs' logs replayed as one |
+| 9 | Masked pass comparison assumes all pages are within half the pass range; restarting at slot 0 breaks that | old page read as newer (argued; ~10⁴ mounts at 16 bits) |
+
+**The 1992 assumption on modern hardware.** "Completion means durable"
+(`recover.c:894`, wam 920624) was the device contract of its day. On a
+volatile write cache it fails three ways, depending on what rests on it:
+an acknowledged commit lost (2), a stolen page outrunning its undo record
+(2), and another owner's data appearing in a file via undo-zero (5).
+
+**Lying drives.** Old/new logging masks a lost write until checkpoint
+truncation discards the redo record; then the loss is silent (4). A
+version held by the parent detects it; reading back before truncating
+repairs it.
+
+**Design properties confirmed**
+
+- Early lock release is safe because recovery stops at the first log gap (3).
+- Undo-zero's "logically ordered" requirement is load-bearing (5).
+- Equivalence-class merge as coded is correct; at full contention a class
+  commit is a checkpoint, at low contention classes commit independently (6).
+- Up-front log reservation is what lets a hot class always drain; on-demand
+  allocation deadlocks (7).
+- Physical old/new logging tolerates torn pages with no doublewrite buffer;
+  LSN-gated delta redo does not (12).
+- The `B_ASYNC` precondition in `efs_newalloc.c` holds (13).
+
+**A repaired mount path.** With a bounded log, a finite pass number is
+safe if nothing stale stays visible (10). Resume after the recovered head,
+bound the writer's distance to the oldest unfinished page, and durably
+overwrite that many slots at mount: passes even with a 3-bit pass field.
+`io_window` must be a distance everywhere (11).
+
+**Open**
+
+- Vnode-lock audit for `epia_MarkInTransit`'s unasserted assumption (13).
+- `resume-chain-long` salvage, undiagnosed (superseded by the scrub design).
+- The `force` admission bypass for undo-zero (7) — caller's size promise unmodelled.
+- Findings 1 and 8 need out-of-order log page completion; whether 1990s
+  I/O paths ever produced it is not established here.
+
+# Details
 
 ## StealNoForce.tla — the protocol, one log record per block
 
@@ -263,3 +324,47 @@ it writes.
     Whether every epia_Strategy caller holds the vnode lock is a
     call-graph audit (VM paging vs. promotion/allocation/volume ops),
     not a model-checking question. Not done.
+
+# Linux jbd2 (mainline 7.3-rc7, af32da4, 2026-10-09)
+
+## JbdFirstCommit.tla — first commit after a clean mount
+
+Modelled from fs/jbd2/{recovery,journal,commit}.c and fs/ext4/super.c.
+Clean mount (s_start == 0) reuses s_sequence + 1 at the same head and
+defers the superblock write to the first commit (JBD2_FLUSHED), which
+writes it with no flags ("ok for write to be flushed only with
+transaction commit"). One transaction per mount: descriptor, B data
+blocks, commit block. Volatile write cache. Recovery as do_one_pass with
+csum v3.
+
+| cfg | commit mode | result |
+|---|---|---|
+| jbd-sync | default: commit block PREFLUSH\|FUA after data | passes (3,123 states) |
+| jbd-async | journal_async_commit: commit block submitted without flush before data is waited on | **fails**: partial replay |
+
+14. **Default jbd2 has Episode's finding-8 shape, made invisible.** The
+    sequence and head are reused after a crash before the first commit,
+    but the commit block's PREFLUSH makes the superblock durable before
+    any commit block can be, so a stale commit with the reused sequence
+    can never be on media while the superblock still says clean. Reuse,
+    never visible — the principle of finding 10, by flush ordering.
+    After a real recovery the superblock is rewritten with REQ_FUA
+    before new transactions ("must make sure information about current
+    log tail is on disk before that") — the Episode fix, already there.
+
+15. **Candidate: journal_async_commit + metadata_csum can partially
+    replay a transaction that never committed.** async_commit's safety
+    rests on the commit block's checksum covering the transaction
+    (commit.c passes crc32_sum, computed only for COMPAT_CHECKSUM, v1).
+    With metadata_csum, ext4 selects CSUM_V3 instead
+    (ext4_set_journal_csum_feature_set); the v3 commit checksum covers
+    the commit block only, and PASS_SCAN does not verify data-block tags
+    (calc_chksums is v1-only). If the commit block lands before a data
+    block and power fails, scan accepts the transaction; PASS_REPLAY
+    writes every tagged block whose checksum matches, skips the rest
+    (EFSBADCRC), and recovery still sync_blockdev()s and flushes. Mount
+    then fails, but the filesystem already holds a torn, never-
+    acknowledged transaction. Scope: non-default option, refused with
+    data=ordered (allowed with data=writeback/journal). Status: model +
+    code reading only. **Not reproduced on a real kernel; not yet
+    checked against linux-ext4 history** — may be known.
