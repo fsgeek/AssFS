@@ -365,6 +365,11 @@ csum v3.
     (EFSBADCRC), and recovery still sync_blockdev()s and flushes. Mount
     then fails, but the filesystem already holds a torn, never-
     acknowledged transaction. Scope: non-default option, refused with
-    data=ordered (allowed with data=writeback/journal). Status: model +
-    code reading only. **Not reproduced on a real kernel; not yet
-    checked against linux-ext4 history** — may be known.
+    data=ordered (allowed with data=writeback/journal).
+    Status: **recovery half reproduced** with e2fsprogs 1.47.0's copy of
+    jbd2 recovery (`repro/jbd2-partial-replay.sh`, no root): of a
+    two-block transaction, block 1000 is replayed and block 1001 is
+    skipped with "Invalid checksum recovering data block 1001 in log".
+    Writer half (commit block submitted before data is waited on) from
+    code reading of commit.c. **Not yet run on a kernel** (needs a VM);
+    **not yet checked against linux-ext4 history** — may be known.
