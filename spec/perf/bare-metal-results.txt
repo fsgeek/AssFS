@@ -1,0 +1,21 @@
+# gazelle (System76, bare metal, Pop!_OS kernel 7.0.11), scratch 8 GiB partition on WD SN850X 1TB (WDS100T1X0E), volatile cache, native FUA, AC power
+AC online: 1   load: 0.08 0.04 0.01
+partition: /dev/nvme0n1p1   8G
+CONFIG data=writeback (rw,relatime,data=writeback)
+RESULT n=2000 ops/s=1148.5 p50=876 p90=1022 p99=1108 us
+RESULT n=2000 ops/s=1271.8 p50=787 p90=985 p99=1094 us
+RESULT n=2000 ops/s=1200.0 p50=831 p90=997 p99=1100 us
+CONFIG data=writeback,journal_async_commit (rw,relatime,journal_async_commit,data=writeback)
+RESULT n=2000 ops/s=1585.3 p50=646 p90=781 p99=841 us
+RESULT n=2000 ops/s=1663.9 p50=623 p90=757 p99=818 us
+RESULT n=2000 ops/s=1555.2 p50=643 p90=769 p99=825 us
+CONFIG data=ordered (rw,relatime,data=ordered)
+RESULT n=2000 ops/s=1163.0 p50=863 p90=1014 p99=1085 us
+RESULT n=2000 ops/s=1126.7 p50=892 p90=1017 p99=1102 us
+RESULT n=2000 ops/s=1120.3 p50=895 p90=1027 p99=1127 us
+cleanup: 0 scratch partitions left
+
+# wam-nuc (bare metal, 6.8.0-139), Intel 660p SSDPEKNW010T9, root ext4 data=ordered sync commit (no scratch space for async)
+RESULT n=2000 ops/s=1408.1 p50=621 p90=1053 p99=1552 us
+RESULT n=2000 ops/s=1491.8 p50=586 p90=994 p99=1521 us
+RESULT n=2000 ops/s=1422.2 p50=619 p90=766 p99=1546 us

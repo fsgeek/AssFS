@@ -500,7 +500,23 @@ host itself): two flushes vs one. That is the mechanism. Sync sends
 PREFLUSH plus a FUA commit write, and virtio-blk has no FUA, so the block
 layer emulates FUA with a post-flush; async sends one trailing flush.
 
-Limits: one machine, a three-layer stack (TCG, then QEMU, then a Hyper-V
+**Bare metal** (`perf/gazelle-bench.sh`, `perf/bare-metal-results.txt`):
+gazelle, a System76 laptop on kernel 7.0.11 with a scratch partition on
+a WD SN850X (consumer NVMe, volatile cache, native FUA), on AC power, a
+fresh mkfs per config, 3 x 2000 ops:
+
+| commit mode | ops/s | p50 | p99 |
+|---|---|---|---|
+| default (sync), data=writeback | 1149–1272 (≈1207) | ≈830 µs | ≈1.10 ms |
+| journal_async_commit, data=writeback | 1555–1664 (≈1601) | ≈637 µs | ≈0.83 ms |
+| default (sync), data=ordered | 1120–1163 (≈1137) | ≈883 µs | ≈1.10 ms |
+
+That is **+33% throughput and −23% median latency** on bare metal: half
+the virtualized gain, as expected, since here sync costs one flush plus
+a native FUA write and flushes are cheap. wam-nuc (Intel 660p, root fs,
+data=ordered, sync) gives a similar sync baseline: ≈1440 ops/s, p50 ≈0.6 ms.
+
+Limits of the virtualized run: one machine, a three-layer stack (TCG, then QEMU, then a Hyper-V
 guest's disk, then NVMe), and an emulated guest CPU. The ratio comes from
 counting flushes; the absolute numbers are this stack's. On bare NVMe with
 native FUA, sync is one flush plus one FUA write. On a drive without
