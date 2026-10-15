@@ -1,4 +1,4 @@
-From d012b1f1123effaa0f1e2822c528bce4db64cbe3 Mon Sep 17 00:00:00 2001
+From 56152665e39f8ef86a3976b827847658f272c7e7 Mon Sep 17 00:00:00 2001
 From: Tony Mason <fsgeek@gatech.edu>
 Date: Wed, 14 Oct 2026 17:39:43 -0700
 Subject: [PATCH] e2fsck: verify journal tag checksums in PASS_SCAN with
@@ -27,6 +27,13 @@ set in the journal superblock): the torn transaction is no longer
 partially replayed; a torn transaction followed by a valid one is
 reported as corrupt; intact journals and sync-commit journals replay as
 before.
+
+Also tested on crash images from a dm-log-writes capture of a 7.3-rc7
+kernel running ext4 with journal_async_commit: of every prefix of the
+log, the six that leave a transaction's commit block on disk without
+all of its data blocks are partly replayed by e2fsck today (leaving an
+unattached inode or a corrupted directory, or an orphan inode that the
+check does not report), and are recovered cleanly with this change.
 
 Assisted-by: Claude-Opus-5.5 TLC
 ---

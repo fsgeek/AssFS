@@ -1,0 +1,104 @@
+   1 FUA        sec       0 n   8    fs x1
+   2 MARK mounted
+   3 -          sec   16528 n  32    fs x4
+   4 META       sec     120 n   8  j0:jsb2(seq 0)
+   5 META       sec     128 n   8  j1:desc(seq 2)
+   6 META       sec     136 n   8  j2:data
+   7 META       sec     144 n   8  j3:data
+   8 META       sec     152 n   8  j4:data
+   9 META       sec     160 n   8  j5:data
+  10 META       sec     168 n   8  j6:data
+  11 META       sec     176 n   8  j7:data
+  12 META       sec     184 n   8  j8:data
+  13 META       sec     192 n   8  j9:commit(seq 2)
+  14 FLUSH      sec       0 n   0  
+  15 MARK fsync1
+  16 -          sec   16560 n  32    fs x4
+  17 META       sec     208 n   8  j10:desc(seq 3)
+  18 META       sec     216 n   8  j11:data
+  19 META       sec     224 n   8  j12:data
+  20 META       sec     232 n   8  j13:data
+  21 META       sec     240 n   8  j14:data
+  22 META       sec     248 n   8  j15:data
+  23 META       sec     256 n   8  j16:data
+  24 META       sec     264 n   8  j17:commit(seq 3)
+  25 FLUSH      sec       0 n   0  
+  26 MARK fsync2
+  27 -          sec   16592 n  32    fs x4
+  28 META       sec    8528 n   8  j25:data
+  29 META       sec    8536 n   8  j26:commit(seq 4)
+  30 META       sec     272 n   8  j18:desc(seq 4)
+  31 META       sec     280 n   8  j19:data
+  32 META       sec     288 n   8  j20:data
+  33 META       sec     296 n   8  j21:data
+  34 META       sec     304 n   8  j22:data
+  35 META       sec     312 n   8  j23:data
+  36 META       sec     320 n   8  j24:data
+  37 FLUSH      sec       0 n   0  
+  38 MARK fsync3
+  39 -          sec   16624 n  32    fs x4
+  40 META       sec    8544 n   8  j27:desc(seq 5)
+  41 META       sec    8552 n   8  j28:data
+  42 META       sec    8560 n   8  j29:data
+  43 META       sec    8568 n   8  j30:data
+  44 META       sec    8576 n   8  j31:data
+  45 META       sec    8584 n   8  j32:data
+  46 META       sec    8592 n   8  j33:data
+  47 META       sec    8600 n   8  j34:data
+  48 META       sec    8608 n   8  j35:commit(seq 5)
+  49 FLUSH      sec       0 n   0  
+  50 MARK fsync4
+  51 -          sec   16656 n  32    fs x4
+  52 META       sec    8616 n   8  j36:desc(seq 6)
+  53 META       sec    8624 n   8  j37:data
+  54 META       sec    8632 n   8  j38:data
+  55 META       sec    8640 n   8  j39:data
+  56 META       sec    8648 n   8  j40:data
+  57 META       sec    8656 n   8  j41:data
+  58 META       sec    8664 n   8  j42:data
+  59 META       sec    8672 n   8  j43:data
+  60 META       sec    8680 n   8  j44:commit(seq 6)
+  61 FLUSH      sec       0 n   0  
+  62 MARK fsync5
+  63 -          sec   16688 n  32    fs x4
+  64 META       sec    8688 n   8  j45:desc(seq 7)
+  65 META       sec    8696 n   8  j46:data
+  66 META       sec    8704 n   8  j47:data
+  67 META       sec    8712 n   8  j48:data
+  68 META       sec    8720 n   8  j49:data
+  69 META       sec    8728 n   8  j50:data
+  70 META       sec    8736 n   8  j51:data
+  71 META       sec    8744 n   8  j52:data
+  72 META       sec    8752 n   8  j53:commit(seq 7)
+  73 FLUSH      sec       0 n   0  
+  74 MARK fsync6
+  75 META       sec     200 n   8    fs x1
+  76 META       sec   16520 n   8    fs x1
+  77 META       sec     328 n   8    fs x1
+  78 META       sec     336 n   8    fs x1
+  79 META       sec      72 n   8    fs x1
+  80 META       sec      80 n   8    fs x1
+  81 META       sec       0 n   8    fs x1
+  82 META       sec       8 n   8    fs x1
+  83 META       sec   20624 n   8    fs x1
+  84 META       sec   20632 n   8    fs x1
+  85 META       sec   20640 n   8    fs x1
+  86 META       sec   20648 n   8    fs x1
+  87 META       sec   20656 n   8    fs x1
+  88 FLUSH      sec       0 n   0  
+  89 FLUSH      sec       0 n   0  
+  90 FUA|META   sec     120 n   8  j0:jsb2(seq 0)
+  91 FLUSH      sec       0 n   0  
+  92 FUA|META   sec     120 n   8  j0:jsb2(seq 0)
+  93 FLUSH      sec       0 n   0  
+  94 FUA|META   sec     120 n   8  j0:jsb2(seq 0)
+  95 FLUSH      sec       0 n   0  
+  96 FUA|META   sec     120 n   8  j0:jsb2(seq 0)
+  97 FLUSH      sec       0 n   0  
+  98 FUA|META   sec     120 n   8  j0:jsb2(seq 0)
+  99 FLUSH      sec       0 n   0  
+ 100 FUA|META   sec     120 n   8  j0:jsb2(seq 0)
+ 101 FLUSH|FUA|META sec     120 n   0  
+ 102 FUA|META   sec     120 n   8  j0:jsb2(seq 0)
+ 103 FUA|META   sec       0 n   8    fs x1
+ 104 MARK dm-log-writes-end

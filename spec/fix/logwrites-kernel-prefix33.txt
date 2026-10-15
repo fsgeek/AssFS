@@ -1,0 +1,14 @@
+#### kernel asis, prefix 33
+EXT4-fs (vda): error loading journal
+JBD2: Invalid checksum recovering data block 10 in journal block 24
+JBD2: Invalid checksum recovering data block 2579 in journal block 23
+JBD2: Invalid checksum recovering data block 9 in journal block 22
+JBD2: journal recovery failed
+mount exit=255
+e2fsck -fn afterwards: Warning: skipping journal recovery because doing a read-only filesystem check. Directory inode 16, block #0, offset 0: directory corrupted Salvage? no k-asis.img: ********** WARNING: Filesystem still has errors ********** 
+#### kernel fixed2, prefix 33
+EXT4-fs (vda): mounted filesystem 91ce64a6-0f93-493b-9d26-47b27322264d r/w with writeback data mode. Quota mode: disabled.
+EXT4-fs (vda): recovery complete
+JBD2: Invalid data block checksum in transaction 4, treating as interrupted async commit
+mount exit=0
+e2fsck -fn afterwards: 

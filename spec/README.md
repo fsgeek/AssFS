@@ -376,8 +376,7 @@ csum v3.
     failed / EXT4-fs (vda): error loading journal"; block 1000 replayed,
     block 1001 not. Not silent — the mount is refused and fsck is forced
     — but the torn, never-acknowledged transaction is already on disk.
-    Writer half (commit block submitted before data is waited on) still
-    from code reading of commit.c; not yet driven by a reordering device.
+    Writer half: **observed** with dm-log-writes on stock 7.3-rc7 (see 17).
     Prior art (archive search, lore not machine-searchable): the pieces
     are each known — async commit's safety was argued from the v1
     whole-transaction crc (Ts'o 2009, 0e3d2a6313d0); v3 drops COMPAT_CHECKSUM
@@ -445,6 +444,31 @@ a full log, and (with corruption) the "later commit means corrupt" error.
     Left as is: tid 0 doubles as "unset" for `end_transaction`, as it
     already does in v1.
 
-    Not done: the writer half has not been driven on a real reordering
-    device (dm-log-writes); the images are constructed. xfstests not run.
+    Not done: xfstests.
+
+## dm-log-writes — the writer, captured (no model)
+
+17. **The torn state comes from the real writer, not only from a
+    reordering cache.** `repro/logwrites/run.sh` mounts ext4
+    (metadata_csum, `journal_async_commit,data=writeback`) through
+    dm-log-writes on stock 7.3-rc7 in QEMU and runs six fsyncs; the log
+    records every write in completion order with its flags
+    (`fix/logwrites-timeline.txt`). Every transaction's descriptor, data
+    and commit block share one flush epoch, the commit block carrying no
+    flags. In transaction 4 the commit block (entry 29) *completed before*
+    its descriptor (30) and six of its seven data blocks (31-36), so a plain
+    prefix of the completion order — what a write-through disk could hold
+    after a crash, the xfstests replay-log method — tears it.
+    Replaying every prefix and running e2fsck (`fix/logwrites-e2fsck-prefixes.txt`):
+    prefixes 30-35 are exactly the window. Stock e2fsck replays part of
+    transaction 4 and then, depending on the prefix, finds an unattached
+    inode, an unconnected directory, a corrupted directory, or nothing:
+    at prefix 30 inode 17 is a live 16 KB file in no directory and no
+    bitmap, hidden from fsck because the group descriptor (which would
+    raise the itable high-water mark) was one of the skipped blocks.
+    Patched e2fsck: "treating as interrupted async commit" and only the
+    free-count fixes every crash image gets. Kernel on prefix 33
+    (`fix/logwrites-kernel-prefix33.txt`): stock fails recovery, leaving
+    "Directory inode 16 ... directory corrupted"; patched mounts and a
+    read-only e2fsck afterwards is clean.
 

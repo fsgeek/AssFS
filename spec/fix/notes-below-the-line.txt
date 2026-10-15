@@ -9,7 +9,7 @@ How this was found and tested, since it was done with an AI assistant
   in a few hundred states.  The models are public (link in the changelog).
 - The assistant wrote the patch, the TLA+ models, and the test scripts;
   I reviewed the patch and the reasoning and am responsible for it.
-- Reproduced and tested in QEMU (TCG, tinyconfig + ext4/jbd2) on 7.3-rc7
+- Also reproduced and tested in QEMU (TCG, tinyconfig + ext4/jbd2) on 7.3-rc7
   with and without the patch, and with e2fsck from e2fsprogs next with
   and without the companion e2fsprogs patch.  Test images are built with
   debugfs ("jo -c; jw; jc", one and two transactions), with one data
@@ -27,11 +27,15 @@ How this was found and tested, since it was done with an AI assistant
       EIO on one T1 block      replayed; mount refused       recovery fails
       (QEMU blkdebug)
 
-- Not done: I have not driven the writer side on a reordering device
-  (e.g. dm-log-writes replay), so the torn state is constructed rather
-  than captured from a real crash; the claim that it can arise rests on
-  journal_submit_commit_record() omitting REQ_PREFLUSH under
-  async_commit.  xfstests has not been run.
+- Writer side: captured with dm-log-writes on stock 7.3-rc7 (six fsyncs);
+  every prefix of the completion-order log was replayed and checked
+  with e2fsck, as xfstests' replay-log tests do.  The six prefixes that
+  tear a transaction are recovered cleanly with the patch; without it
+  e2fsck reports unattached inodes or corrupted directories, or nothing
+  at all for one prefix that leaves an orphan inode outside the bitmaps.
+  The log, the per-prefix results and the scripts are in the repo linked
+  from the changelog.
+- Not done: xfstests has not been run.
 - Left alone: tid 0 doubles as "unset" for info->end_transaction, as in
   the v1 path; calc_chksums() (v1) turns a read error into an end of log,
   which can drop committed transactions silently -- the same shape this

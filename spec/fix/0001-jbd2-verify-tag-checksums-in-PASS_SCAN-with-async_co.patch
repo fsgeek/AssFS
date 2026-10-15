@@ -1,4 +1,4 @@
-From f05564a20b1bb48d5c27070bb64401087034e7b1 Mon Sep 17 00:00:00 2001
+From 0875dfe6f3fd6fda9ca89eb2c2d25a3e93be8b6e Mon Sep 17 00:00:00 2001
 From: Tony Mason <fsgeek@gatech.edu>
 Date: Wed, 14 Oct 2026 17:37:55 -0700
 Subject: [PATCH] jbd2: verify tag checksums in PASS_SCAN with async_commit
@@ -23,16 +23,28 @@ written to their home locations, the rest are not, recovery returns
 disk, and e2fsck has to repair a state the journal was meant to make
 impossible.
 
-Reproduced on 7.3-rc7 in QEMU with a csum v3 journal with async_commit
-set, one transaction of two blocks, and the second block's journal copy
-replaced by stale content:
+Reproduced on 7.3-rc7 in QEMU.  A dm-log-writes capture of ext4
+(metadata_csum, journal_async_commit,data=writeback) running six fsyncs
+shows each transaction's descriptor, data and commit blocks in one
+flush epoch with no flags on the commit block, and in one transaction
+the commit block completing before its descriptor and six of its seven
+data blocks.  Replaying the log up to just after the descriptor (a
+plain prefix of the completion order) and mounting gives:
 
-  JBD2: Invalid checksum recovering data block 1001 in journal block 3
+  JBD2: Invalid checksum recovering data block 9 in journal block 22
+  JBD2: Invalid checksum recovering data block 2579 in journal block 23
+  JBD2: Invalid checksum recovering data block 10 in journal block 24
   JBD2: journal recovery failed
   EXT4-fs (vda): error loading journal
 
-after which fs block 1000 holds the new contents and fs block 1001 the
-old.
+and e2fsck then finds "Directory inode 16, block #0, offset 0: directory
+corrupted": of the transaction's seven blocks, the inode bitmap, group
+descriptor and both inode table blocks were replayed, so the new
+directory's inode exists, but its directory block, the parent's
+directory block and the block bitmap were not. Across the six affected
+prefixes e2fsck's own replay leaves, depending on the prefix, an
+unattached inode, an unconnected or corrupted directory, or a live inode
+outside every bitmap that fsck does not report at all.
 
 Restore the v1 semantics for v2/v3: when async_commit is set, check the
 tag checksums of each transaction in PASS_SCAN.  If one fails, treat
