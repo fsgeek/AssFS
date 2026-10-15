@@ -466,6 +466,12 @@ a full log, and (with corruption) the "later commit means corrupt" error.
     at prefix 30 inode 17 is a live 16 KB file in no directory and no
     bitmap, hidden from fsck because the group descriptor (which would
     raise the itable high-water mark) was one of the skipped blocks.
+    Checked further: a second fsck is clean, and new allocations reuse
+    inode 17 and all four of its blocks with fsck still silent. That is
+    harmless here: nothing references the stray file (its directory entry
+    was in the unreplayed root block) and its transaction was never
+    acknowledged, so the end state is the same as a rollback. A leak
+    that gets recycled, not corruption.
     Patched e2fsck: "treating as interrupted async commit" and only the
     free-count fixes every crash image gets. Kernel on prefix 33
     (`fix/logwrites-kernel-prefix33.txt`): stock fails recovery, leaving

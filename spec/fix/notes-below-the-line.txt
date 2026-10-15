@@ -44,8 +44,8 @@ How this was found and tested, since it was done with an AI assistant
   every prefix of the completion-order log was replayed and checked
   with e2fsck, as xfstests' replay-log tests do.  The six prefixes that
   tear a transaction are recovered cleanly with the patch; without it
-  e2fsck reports unattached inodes or corrupted directories, or nothing
-  at all for one prefix that leaves a live inode outside every bitmap.
+  e2fsck partly replays all six, leaving unattached inodes or
+  unconnected or corrupted directories in four of them.
   The log, the per-prefix results and the scripts are in the repo linked
   from the changelog.
 - Not done: xfstests has not been run.

@@ -1,4 +1,4 @@
-From 1e9c3a708e208e89e6f846864ab20486c682710b Mon Sep 17 00:00:00 2001
+From 95ec3392f528d06a8de7ef6438fa53a3f442a294 Mon Sep 17 00:00:00 2001
 From: Tony Mason <fsgeek@gatech.edu>
 Date: Wed, 14 Oct 2026 17:37:55 -0700
 Subject: [PATCH] jbd2: verify tag checksums in PASS_SCAN with async_commit
@@ -43,9 +43,8 @@ corrupted": of the transaction's seven blocks, the inode bitmap, group
 descriptor and both inode table blocks were replayed, so the new
 directory's inode exists, but its directory block, the parent's
 directory block and the block bitmap were not. Across the six affected
-prefixes e2fsck's own replay leaves, depending on the prefix, an
-unattached inode, an unconnected or corrupted directory, or a live inode
-outside every bitmap that fsck does not report at all.
+prefixes, e2fsck's own replay leaves an unattached inode or an
+unconnected or corrupted directory in four of them.
 
 Restore the v1 semantics for v2/v3: when async_commit is set, check the
 tag checksums of each transaction in PASS_SCAN.  If one fails, treat
