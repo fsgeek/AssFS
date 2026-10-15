@@ -370,6 +370,18 @@ csum v3.
     jbd2 recovery (`repro/jbd2-partial-replay.sh`, no root): of a
     two-block transaction, block 1000 is replayed and block 1001 is
     skipped with "Invalid checksum recovering data block 1001 in log".
-    Writer half (commit block submitted before data is waited on) from
-    code reading of commit.c. **Not yet run on a kernel** (needs a VM);
-    **not yet checked against linux-ext4 history** — may be known.
+    **Kernel: reproduced on mainline 7.3-rc7 (24a19b953)** in QEMU
+    (`repro/jbd2-partial-replay-kernel.sh`): "JBD2: Invalid checksum
+    recovering data block 1001 in journal block 3 / journal recovery
+    failed / EXT4-fs (vda): error loading journal"; block 1000 replayed,
+    block 1001 not. Not silent — the mount is refused and fsck is forced
+    — but the torn, never-acknowledged transaction is already on disk.
+    Writer half (commit block submitted before data is waited on) still
+    from code reading of commit.c; not yet driven by a reordering device.
+    Prior art (archive search, lore not machine-searchable): the pieces
+    are each known — async commit's safety was argued from the v1
+    whole-transaction crc (Ts'o 2009, 0e3d2a6313d0); v3 drops COMPAT_CHECKSUM
+    (Wong 2014); async_commit forbidden with data=ordered for a different
+    reason (Kara 2014, d4f761074353); per-block skip proposed as a feature
+    (Dilger 2021); Ts'o (bugzilla 93031, 2015) called async_commit "not
+    safe" without saying why. Nothing found combining them.
