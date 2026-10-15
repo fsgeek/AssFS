@@ -1,0 +1,44 @@
+[Goes after the "---" in the jbd2 patch email; not part of the commit.]
+
+How this was found and tested, since it was done with an AI assistant
+(Claude Opus 5.5, in Claude Code):
+
+- Found by modelling jbd2's commit and recovery paths in TLA+ from the
+  7.3-rc7 source, as part of a broader exercise model-checking journal
+  recovery designs.  The model predicted the partial replay; TLC finds it
+  in a few hundred states.  The models are public (link in the changelog).
+- The assistant wrote the patch, the TLA+ models, and the test scripts;
+  I reviewed the patch and the reasoning and am responsible for it.
+- Reproduced and tested in QEMU (TCG, tinyconfig + ext4/jbd2) on 7.3-rc7
+  with and without the patch, and with e2fsck from e2fsprogs next with
+  and without the companion e2fsprogs patch.  Test images are built with
+  debugfs ("jo -c; jw; jc", one and two transactions), with one data
+  block's journal copy overwritten, and with
+  JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT set in the journal superblock:
+
+    image                      7.3-rc7                       patched
+    async, T1 torn             1000 replayed, 1001 not;      nothing replayed;
+                               mount refused                 mount succeeds
+    async, T1 torn, T2 valid   T1 half and T2 replayed;      nothing replayed;
+                               mount refused                 "transaction 1 is corrupt"
+    async, intact              replayed                      replayed
+    sync, torn / intact        refused / replayed            unchanged
+    async, 40-block T1, T2,    T1 minus that block and T2    nothing replayed;
+      EIO on one T1 block      replayed; mount refused       recovery fails
+      (QEMU blkdebug)
+
+- Not done: I have not driven the writer side on a reordering device
+  (e.g. dm-log-writes replay), so the torn state is constructed rather
+  than captured from a real crash; the claim that it can arise rests on
+  journal_submit_commit_record() omitting REQ_PREFLUSH under
+  async_commit.  xfstests has not been run.
+- Left alone: tid 0 doubles as "unset" for info->end_transaction, as in
+  the v1 path; calc_chksums() (v1) turns a read error into an end of log,
+  which can drop committed transactions silently -- the same shape this
+  patch avoids for v2/v3; and this is a third copy of the tag walk
+  (count_tags, jbd2_do_replay).  Happy to follow up on any of these.
+- The hoisted j_failed_commit check also changes one existing case: a v2/v3
+  async journal whose commit block fails its checksum and is followed by a
+  later valid commit used to be truncated silently and is now reported
+  as corrupt.  This seemed right by the same argument, but I'd welcome
+  a view on it.

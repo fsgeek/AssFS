@@ -1,0 +1,222 @@
+From f05564a20b1bb48d5c27070bb64401087034e7b1 Mon Sep 17 00:00:00 2001
+From: Tony Mason <fsgeek@gatech.edu>
+Date: Wed, 14 Oct 2026 17:37:55 -0700
+Subject: [PATCH] jbd2: verify tag checksums in PASS_SCAN with async_commit
+
+With journal_async_commit the commit block is submitted without
+REQ_PREFLUSH, together with the descriptor and data blocks, and the
+transaction is only made durable by the blkdev_issue_flush() that
+follows.  On a device with a volatile write cache a crash before that
+flush can leave the commit block on media while some of the blocks it
+covers are not.  The transaction was never acknowledged.
+
+The csum v1 design handles this: the commit block carries a crc32 over
+the whole transaction, PASS_SCAN recomputes it, and under async_commit
+a mismatch ends the log at that transaction ("interrupted commit")
+instead of failing.  With csum v2/v3 there is no whole-transaction
+checksum.  PASS_SCAN accepts the transaction on the descriptor and
+commit block checksums alone, and PASS_REPLAY then writes every tagged
+block whose own checksum matches and skips those that do not.  The
+result is a partially replayed transaction: some of its blocks are
+written to their home locations, the rest are not, recovery returns
+-EFSBADCRC and the mount fails.  By then the torn transaction is on
+disk, and e2fsck has to repair a state the journal was meant to make
+impossible.
+
+Reproduced on 7.3-rc7 in QEMU with a csum v3 journal with async_commit
+set, one transaction of two blocks, and the second block's journal copy
+replaced by stale content:
+
+  JBD2: Invalid checksum recovering data block 1001 in journal block 3
+  JBD2: journal recovery failed
+  EXT4-fs (vda): error loading journal
+
+after which fs block 1000 holds the new contents and fs block 1001 the
+old.
+
+Restore the v1 semantics for v2/v3: when async_commit is set, check the
+tag checksums of each transaction in PASS_SCAN.  If one fails, treat
+the transaction like a v1 checksum failure: end the log before it, and
+keep scanning.  Because kjournald2 does not start writing transaction
+n+1 until the flush for transaction n has completed, finding a later
+commit block means (with barriers) that transaction n reached media and
+is corrupt rather than interrupted; set j_failed_commit and fail the
+mount, as the v1 path already does.  That check moves out of the
+v1-only branch so it applies to both, which also covers a v2/v3 async
+commit block with a bad checksum followed by a later valid one,
+previously truncated silently.  An IO error while reading a block for
+the check fails recovery rather than ending the log there.
+
+jbd2_journal_skip_recovery() also runs PASS_SCAN, but there the log is
+being discarded, so clear j_failed_commit; otherwise
+jbd2_journal_wipe() followed by jbd2_journal_load() would now refuse
+the mount.
+
+The cost is the one async_commit already has with v1: if media
+corruption hits a data block of the last transaction in the log, that
+transaction is discarded rather than reported, since nothing on disk
+distinguishes it from an interrupted commit.  A warning is logged.  The
+check covers revoked blocks too, since the revoke table is not built
+until PASS_REVOKE, and PASS_SCAN now reads every journal data block
+under async_commit, as it already does for v1.
+
+Sync commit is unchanged: there the commit block is written with
+REQ_PREFLUSH | REQ_FUA after its blocks complete, so a bad tag in a
+committed transaction is corruption and the existing error path is
+right.
+
+The writer and recovery protocol were model-checked with TLA+ (no
+partial replay, every acknowledged transaction replayed, no false
+corruption reports without media corruption), along with the failing
+cases above.  The models are at
+https://github.com/fsgeek/AssFS/tree/spec/tla-models/spec
+
+Fixes: c390087591dc ("jbd2: checksum data blocks that are stored in the journal")
+Assisted-by: Claude-Opus-5.5 TLC
+---
+ fs/jbd2/recovery.c | 87 ++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 81 insertions(+), 6 deletions(-)
+
+diff --git a/fs/jbd2/recovery.c b/fs/jbd2/recovery.c
+index cac8c2cd4..ccad28f22 100644
+--- a/fs/jbd2/recovery.c
++++ b/fs/jbd2/recovery.c
+@@ -383,6 +383,8 @@ int jbd2_journal_skip_recovery(journal_t *journal)
+ 		journal->j_head = info.head_block;
+ 	}
+ 
++	/* The log is being discarded, so a corrupt transaction in it is moot. */
++	journal->j_failed_commit = 0;
+ 	journal->j_tail = 0;
+ 	return err;
+ }
+@@ -487,6 +489,53 @@ static int jbd2_block_tag_csum_verify(journal_t *j, journal_block_tag_t *tag,
+ 		return tag->t_checksum == cpu_to_be16(csum32);
+ }
+ 
++/*
++ * With async_commit the commit block is written without a preceding flush,
++ * so it can reach the disk before the blocks it covers.  A commit block alone
++ * then does not prove that the transaction is complete; check the per-tag
++ * checksums of the transaction during PASS_SCAN.  Returns 0 if all tagged
++ * blocks match, -EFSBADCRC if one does not, or the error from reading one.
++ */
++static int jbd2_descr_tags_csum_verify(journal_t *journal,
++				       struct buffer_head *bh,
++				       unsigned long *next_log_block,
++				       unsigned int sequence)
++{
++	int tag_bytes = journal_tag_bytes(journal);
++	int size = journal->j_blocksize - sizeof(struct jbd2_journal_block_tail);
++	journal_block_tag_t tag;
++	struct buffer_head *obh;
++	unsigned long io_block;
++	int ret = 0, err;
++	char *tagp;
++
++	tagp = &bh->b_data[sizeof(journal_header_t)];
++	while (tagp - bh->b_data + tag_bytes <= size) {
++		memcpy(&tag, tagp, sizeof(tag));
++
++		io_block = (*next_log_block)++;
++		wrap(journal, *next_log_block);
++		err = jread(&obh, journal, io_block);
++		if (err) {
++			pr_err("JBD2: IO error %d recovering block %lu in log\n",
++			       err, io_block);
++			return err;
++		}
++		if (!ret && !jbd2_block_tag_csum_verify(journal, &tag,
++						(journal_block_tag3_t *)tagp,
++						obh->b_data, sequence))
++			ret = -EFSBADCRC;
++		brelse(obh);
++
++		tagp += tag_bytes;
++		if (!(tag.t_flags & cpu_to_be16(JBD2_FLAG_SAME_UUID)))
++			tagp += 16;
++		if (tag.t_flags & cpu_to_be16(JBD2_FLAG_LAST_TAG))
++			break;
++	}
++	return ret;
++}
++
+ static __always_inline int jbd2_do_replay(journal_t *journal,
+ 					  struct recovery_info *info,
+ 					  struct buffer_head *bh,
+@@ -598,6 +647,7 @@ static int do_one_pass(journal_t *journal,
+ 	int			blocktype;
+ 	__u32			crc32_sum = ~0; /* Transactional Checksums */
+ 	bool			need_check_commit_time = false;
++	bool			tag_csum_error = false;
+ 	__u64			last_trans_commit_time = 0, commit_time;
+ 
+ 	/*
+@@ -735,6 +785,19 @@ static int do_one_pass(journal_t *journal,
+ 						break;
+ 					continue;
+ 				}
++				if (pass == PASS_SCAN &&
++				    jbd2_journal_has_csum_v2or3(journal) &&
++				    jbd2_has_feature_async_commit(journal) &&
++				    !info->end_transaction) {
++					err = jbd2_descr_tags_csum_verify(journal,
++							bh, &next_log_block,
++							next_commit_ID);
++					if (err == -EFSBADCRC)
++						tag_csum_error = true;
++					else if (err)
++						goto failed;
++					continue;
++				}
+ 				next_log_block += count_tags(journal, bh);
+ 				wrap(journal, next_log_block);
+ 				continue;
+@@ -817,6 +880,18 @@ static int do_one_pass(journal_t *journal,
+ 				goto done;
+ 			}
+ 
++			/*
++			 * A commit block after a transaction that failed its
++			 * checksums under async_commit: with barriers, that
++			 * transaction was flushed before this one was
++			 * written, so it is corrupt rather than interrupted.
++			 */
++			if (info->end_transaction) {
++				journal->j_failed_commit =
++					info->end_transaction;
++				break;
++			}
++
+ 			/*
+ 			 * Found an expected commit block: if checksums
+ 			 * are present, verify them in PASS_SCAN; else not
+@@ -829,12 +904,6 @@ static int do_one_pass(journal_t *journal,
+ 				unsigned found_chksum =
+ 					be32_to_cpu(cbh->h_chksum[0]);
+ 
+-				if (info->end_transaction) {
+-					journal->j_failed_commit =
+-						info->end_transaction;
+-					break;
+-				}
+-
+ 				/* Neither checksum match nor unused? */
+ 				if (!((crc32_sum == found_chksum &&
+ 				       cbh->h_chksum_type ==
+@@ -850,6 +919,12 @@ static int do_one_pass(journal_t *journal,
+ 				goto chksum_ok;
+ 			}
+ 
++			if (tag_csum_error) {
++				pr_warn("JBD2: Invalid data block checksum in transaction %u, treating as interrupted async commit\n",
++					next_commit_ID);
++				goto chksum_error;
++			}
++
+ 			if (jbd2_commit_block_csum_verify(journal, bh->b_data))
+ 				goto chksum_ok;
+ 
+-- 
+2.43.0
+

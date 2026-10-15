@@ -385,3 +385,66 @@ csum v3.
     reason (Kara 2014, d4f761074353); per-block skip proposed as a feature
     (Dilger 2021); Ts'o (bugzilla 93031, 2015) called async_commit "not
     safe" without saying why. Nothing found combining them.
+
+## JbdAsync.tla — async commit across transactions, and the fix
+
+Several transactions committed in turn (kjournald2 does not start
+transaction n+1 until n's trailing flush returns), each as
+journal_async_commit writes it: descriptor, data and commit block with no
+flush, wait, `blkdev_issue_flush`, acknowledge. Optional media corruption
+of one data block of an acknowledged transaction. Recovery as written
+(FIX = FALSE) or with the proposed PASS_SCAN tag check (FIX = TRUE).
+Invariants: no transaction partly replayed (Atomic); a successful mount
+has every acknowledged transaction (Durable); no mount failure without
+media corruption (NoFalseAlarm).
+
+| cfg | mode | result |
+|---|---|---|
+| jasync-asis | async, as written | **fails** |
+| jasync-fix | async, fix | passes, T=3 (247 states) |
+| jasync-sync | sync commit, as written | passes |
+| jasync-fix-corrupt | async, fix, media corruption | **fails Durable**: corrupt last txn dropped |
+| jasync-asis-corrupt | async, as written, media corruption | **fails** |
+
+The passes are small but not hollow. Probe invariants confirmed that the
+fix model reaches truncation of a torn transaction behind an intact one,
+a full log, and (with corruption) the "later commit means corrupt" error.
+
+16. **Fix for 15: check the tags in PASS_SCAN under async_commit.**
+    Restores what the v1 design gave async commit. If a transaction's tag
+    checksums fail, end the log before it (an interrupted commit). If a
+    later commit block follows, the failed transaction must have been
+    flushed, so it is corrupt: set `j_failed_commit` and refuse the mount,
+    as v1 does. The cost is the one v1 async already pays: corruption
+    of the *last* transaction's data looks exactly like an interrupted
+    commit, so that acknowledged transaction is dropped, with a notice
+    (jasync-fix-corrupt). Sync commit is untouched.
+    Patches: `fix/0001-jbd2-*.patch` (7.3-rc7) and `fix/0001-e2fsck-*.patch`
+    (e2fsprogs next, 8fd7952). Tested on images from
+    `repro/jbd2-async-fix-matrix.sh` (async flag set in the journal
+    superblock by `repro/jsb-async.py`), on stock and patched kernels in
+    QEMU and on stock and patched e2fsck (`fix/*-results.txt`):
+
+    | image | stock | patched |
+    |---|---|---|
+    | async, T1 torn | 1000 replayed, 1001 not; mount refused | nothing replayed; mount OK, notice |
+    | async, T1 torn, T2 valid | T1 half **and T2** replayed; refused | nothing replayed; "transaction 1 is corrupt"; refused |
+    | async intact (1 or 2 txns) | replayed | replayed |
+    | sync torn / intact | refused / replayed | unchanged |
+    | async, T1 = 40 blocks, T2 valid, EIO on one T1 block (blkdebug) | T1 minus that block **and T2** replayed; refused | nothing replayed; recovery fails |
+
+    An independent review of the first version found a regression, which
+    the run above confirms (`fix/kernel-eio-results.txt`, "fixed"): an IO
+    error during the new scan check `break`s out of the switch only, so
+    the scan resumed at the next block and ended there, and the mount
+    *succeeded* with both committed transactions silently dropped. (The
+    v1 `calc_chksums` path has the same shape.) Fixed: the error now
+    fails recovery. The review also found that `jbd2_journal_wipe()`
+    would refuse the mount, since `skip_recovery` runs PASS_SCAN and could
+    now set `j_failed_commit`; `skip_recovery` now clears it.
+    Left as is: tid 0 doubles as "unset" for `end_transaction`, as it
+    already does in v1.
+
+    Not done: the writer half has not been driven on a real reordering
+    device (dm-log-writes); the images are constructed. xfstests not run.
+

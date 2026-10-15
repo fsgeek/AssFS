@@ -1,0 +1,93 @@
+######## asis / async-torn
+JBD2: Invalid checksum recovering data block 1001 in journal block 3
+EXT4-fs (vda): error loading journal
+mount exit=255
+JBD2: Invalid checksum recovering data block 1001 in journal block 3
+JBD2: journal recovery failed
+EXT4-fs (vda): error loading journal
+fs block 1000:  A A A A
+fs block 1001:  \0 \0 \0 \0
+fs block 1002:  \0 \0 \0 \0
+######## asis / async-ok
+mount exit=0
+EXT4-fs (vda): recovery complete
+fs block 1000:  A A A A
+fs block 1001:  B B B B
+fs block 1002:  \0 \0 \0 \0
+######## asis / async-two-torn1
+JBD2: Invalid checksum recovering data block 1001 in journal block 3
+EXT4-fs (vda): error loading journal
+mount exit=255
+JBD2: Invalid checksum recovering data block 1001 in journal block 3
+JBD2: journal recovery failed
+EXT4-fs (vda): error loading journal
+fs block 1000:  A A A A
+fs block 1001:  \0 \0 \0 \0
+fs block 1002:  C C C C
+######## asis / async-two-ok
+mount exit=0
+EXT4-fs (vda): recovery complete
+fs block 1000:  A A A A
+fs block 1001:  B B B B
+fs block 1002:  C C C C
+######## asis / sync-torn
+JBD2: Invalid checksum recovering data block 1001 in journal block 3
+EXT4-fs (vda): error loading journal
+mount exit=255
+JBD2: Invalid checksum recovering data block 1001 in journal block 3
+JBD2: journal recovery failed
+EXT4-fs (vda): error loading journal
+fs block 1000:  A A A A
+fs block 1001:  \0 \0 \0 \0
+fs block 1002:  \0 \0 \0 \0
+######## asis / sync-ok
+mount exit=0
+EXT4-fs (vda): recovery complete
+fs block 1000:  A A A A
+fs block 1001:  B B B B
+fs block 1002:  \0 \0 \0 \0
+######## fixed / async-torn
+mount exit=0
+JBD2: Invalid data block checksum in transaction 1, treating as interrupted async commit
+EXT4-fs (vda): recovery complete
+fs block 1000:  \0 \0 \0 \0
+fs block 1001:  \0 \0 \0 \0
+fs block 1002:  \0 \0 \0 \0
+######## fixed / async-ok
+mount exit=0
+EXT4-fs (vda): recovery complete
+fs block 1000:  A A A A
+fs block 1001:  B B B B
+fs block 1002:  \0 \0 \0 \0
+######## fixed / async-two-torn1
+JBD2: journal transaction 1 on vda-8 is corrupt.
+EXT4-fs (vda): error loading journal
+mount exit=255
+JBD2: Invalid data block checksum in transaction 1, treating as interrupted async commit
+JBD2: journal transaction 1 on vda-8 is corrupt.
+EXT4-fs (vda): error loading journal
+fs block 1000:  \0 \0 \0 \0
+fs block 1001:  \0 \0 \0 \0
+fs block 1002:  \0 \0 \0 \0
+######## fixed / async-two-ok
+mount exit=0
+EXT4-fs (vda): recovery complete
+fs block 1000:  A A A A
+fs block 1001:  B B B B
+fs block 1002:  C C C C
+######## fixed / sync-torn
+JBD2: Invalid checksum recovering data block 1001 in journal block 3
+EXT4-fs (vda): error loading journal
+mount exit=255
+JBD2: Invalid checksum recovering data block 1001 in journal block 3
+JBD2: journal recovery failed
+EXT4-fs (vda): error loading journal
+fs block 1000:  A A A A
+fs block 1001:  \0 \0 \0 \0
+fs block 1002:  \0 \0 \0 \0
+######## fixed / sync-ok
+mount exit=0
+EXT4-fs (vda): recovery complete
+fs block 1000:  A A A A
+fs block 1001:  B B B B
+fs block 1002:  \0 \0 \0 \0

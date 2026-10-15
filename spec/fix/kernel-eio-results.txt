@@ -1,0 +1,39 @@
+#### asis / long (T1 = 40 blocks, T2 = 1050) + EIO on journal offset 38 (fs 1036's copy)
+EXT4-fs (vda): error loading journal
+fs block 1000:  A A A A
+fs block 1035:  J J J J
+fs block 1036:  \0 \0 \0 \0
+fs block 1039:  N N N N
+fs block 1050:  C C C C
+I/O error, dev vda, sector 8592 op 0x0:(READ) flags 0x800000 phys_seg 9 prio class 2
+I/O error, dev vda, sector 8632 op 0x0:(READ) flags 0x800000 phys_seg 1 prio class 2
+JBD2: Failed to read block at offset 33
+JBD2: Failed to read block at offset 38
+JBD2: IO error -5 recovering block 33 in log
+JBD2: IO error -5 recovering block 38 in log
+JBD2: journal recovery failed
+mount exit=255
+#### fixed / long (T1 = 40 blocks, T2 = 1050) + EIO on journal offset 38 (fs 1036's copy)
+EXT4-fs (vda): mounted filesystem 44f54e92-c0c8-4232-ae67-4d52de8b4916 r/w with writeback data mode. Quota mode: disabled.
+EXT4-fs (vda): recovery complete
+fs block 1000:  \0 \0 \0 \0
+fs block 1035:  \0 \0 \0 \0
+fs block 1036:  \0 \0 \0 \0
+fs block 1039:  \0 \0 \0 \0
+fs block 1050:  \0 \0 \0 \0
+I/O error, dev vda, sector 8592 op 0x0:(READ) flags 0x800000 phys_seg 32 prio class 2
+JBD2: Failed to read block at offset 33
+JBD2: IO error -5 recovering block 33 in log
+mount exit=0
+#### fixed2 / long (T1 = 40 blocks, T2 = 1050) + EIO on journal offset 38 (fs 1036's copy)
+EXT4-fs (vda): error loading journal
+fs block 1000:  \0 \0 \0 \0
+fs block 1035:  \0 \0 \0 \0
+fs block 1036:  \0 \0 \0 \0
+fs block 1039:  \0 \0 \0 \0
+fs block 1050:  \0 \0 \0 \0
+I/O error, dev vda, sector 8592 op 0x0:(READ) flags 0x800000 phys_seg 32 prio class 2
+JBD2: Failed to read block at offset 33
+JBD2: IO error -5 recovering block 33 in log
+JBD2: journal recovery failed
+mount exit=255
