@@ -1,5 +1,18 @@
 [Goes after the "---" in the jbd2 patch email; not part of the commit.]
 
+Why it matters despite being a non-default option: journal_async_commit
+exists to cut fsync latency, by dropping the wait for the data blocks and
+the PREFLUSH|FUA commit write in favour of one trailing flush.  That pays
+off most where cache flushes are expensive, which mostly means devices
+with volatile write caches, which is also where a power cut mid-commit is
+most likely to leave the torn state.  (That is an argument; I have not
+measured the speedup.)  And the dm-log-writes capture below shows the
+window comes from jbd2's own submission order, so even devices with
+power-loss protection are not exempt.  The people who choose this option
+are the ones exposed, and the safety argument it was built on, the v1
+whole-transaction checksum, does not apply under csum v2/v3, which
+metadata_csum selects.
+
 How this was found and tested, since it was done with an AI assistant
 (Claude Opus 5.5, in Claude Code):
 
