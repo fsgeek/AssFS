@@ -478,3 +478,33 @@ a full log, and (with corruption) the "later commit means corrupt" error.
     "Directory inode 16 ... directory corrupted"; patched mounts and a
     read-only e2fsck afterwards is clean.
 
+## What async commit buys — measured (perf/)
+
+`perf/fsb.c` appends 4 KiB and fsyncs, 1000 times, so every op is a journal
+commit. Guest: 7.3-rc7 (the fix only touches recovery, so runtime is stock)
+in QEMU TCG, ext4 metadata_csum, virtio disk backed by a preallocated raw
+file opened `cache=none`, so each guest flush is a real `fdatasync` on the
+host. Host: Ubuntu 24 running as a Hyper-V guest on a Toshiba RD400 NVMe
+(consumer, volatile write cache). `cache=unsafe` (flushes ignored) gives
+the emulation baseline.
+
+| commit mode | real flushes: ops/s | p50 | flushes ignored: ops/s | p50 |
+|---|---|---|---|---|
+| default (sync), data=writeback | 107–116 (≈111) | ≈8.6 ms | 381–409 | ≈2.5 ms |
+| journal_async_commit, data=writeback | 177–192 (≈187) | ≈5.2 ms | 478–518 | ≈1.9 ms |
+
+Async commit: **+68% fsync throughput, −40% latency** when flushes are real.
+Subtracting the baseline leaves ≈6 ms of flush cost per sync commit and
+≈3 ms per async commit, against ≈3 ms per host-side flush (`fsb` on the
+host itself): two flushes vs one. That is the mechanism. Sync sends
+PREFLUSH plus a FUA commit write, and virtio-blk has no FUA, so the block
+layer emulates FUA with a post-flush; async sends one trailing flush.
+
+Limits: one machine, a three-layer stack (TCG, then QEMU, then a Hyper-V
+guest's disk, then NVMe), and an emulated guest CPU. The ratio comes from
+counting flushes; the absolute numbers are this stack's. On bare NVMe with
+native FUA, sync is one flush plus one FUA write. On a drive without
+power-loss protection, I expect the FUA write to cost about what a flush
+does, but I have not measured it. With power-loss protection a flush is
+cheap and the gain should shrink.
+\n

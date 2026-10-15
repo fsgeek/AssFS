@@ -1,0 +1,36 @@
+# sparse host image (first pass; host allocation noise)
+cache=none opts=data=writeback RESULT n=1000 ops/s=69.0 p50=16001 p90=16001 p99=40002 us
+cache=none opts=data=writeback RESULT n=1000 ops/s=103.1 p50=8001 p90=12001 p99=24002 us
+cache=none opts=data=writeback RESULT n=1000 ops/s=105.7 p50=8001 p90=12001 p99=12001 us
+cache=none opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=161.2 p50=6064 p90=7119 p99=8285 us
+cache=none opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=159.6 p50=5986 p90=6967 p99=17891 us
+cache=none opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=170.2 p50=5805 p90=6668 p99=7613 us
+cache=none opts=data=ordered RESULT n=1000 ops/s=93.3 p50=9625 p90=11123 p99=34436 us
+cache=none opts=data=ordered RESULT n=1000 ops/s=103.1 p50=9463 p90=10991 p99=12662 us
+cache=none opts=data=ordered RESULT n=1000 ops/s=109.1 p50=8833 p90=10254 p99=20905 us
+cache=unsafe opts=data=writeback RESULT n=1000 ops/s=385.2 p50=2492 p90=3330 p99=4772 us
+cache=unsafe opts=data=writeback RESULT n=1000 ops/s=381.3 p50=2548 p90=3442 p99=4382 us
+cache=unsafe opts=data=writeback RESULT n=1000 ops/s=408.6 p50=2348 p90=3252 p99=3964 us
+cache=unsafe opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=493.7 p50=1937 p90=2692 p99=3558 us
+cache=unsafe opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=478.1 p50=1992 p90=2761 p99=3571 us
+cache=unsafe opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=518.2 p50=1861 p90=2742 p99=3453 us
+cache=unsafe opts=data=ordered RESULT n=1000 ops/s=385.5 p50=2482 p90=3378 p99=4646 us
+cache=unsafe opts=data=ordered RESULT n=1000 ops/s=373.3 p50=2577 p90=3445 p99=4626 us
+cache=unsafe opts=data=ordered RESULT n=1000 ops/s=390.9 p50=2430 p90=3387 p99=4542 us
+# preallocated host image
+cache=none opts=data=writeback RESULT n=1000 ops/s=110.8 p50=8907 p90=10118 p99=11410 us
+cache=none opts=data=writeback RESULT n=1000 ops/s=110.2 p50=8688 p90=10066 p99=19128 us
+cache=none opts=data=writeback RESULT n=1000 ops/s=114.4 p50=8468 p90=9671 p99=18622 us
+cache=none opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=185.8 p50=5229 p90=6108 p99=7846 us
+cache=none opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=191.3 p50=5148 p90=5938 p99=6970 us
+cache=none opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=192.3 p50=5127 p90=5907 p99=6802 us
+cache=none opts=data=writeback RESULT n=1000 ops/s=106.6 p50=8516 p90=9836 p99=25716 us
+cache=none opts=data=writeback RESULT n=1000 ops/s=110.2 p50=8804 p90=10007 p99=17548 us
+cache=none opts=data=writeback RESULT n=1000 ops/s=116.3 p50=8403 p90=9734 p99=11709 us
+cache=none opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=177.1 p50=5410 p90=6411 p99=13080 us
+cache=none opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=190.9 p50=5119 p90=6036 p99=7245 us
+cache=none opts=data=writeback,journal_async_commit RESULT n=1000 ops/s=182.7 p50=5314 p90=6168 p99=7768 us
+# host (Hyper-V guest ext4 on RD400, data=ordered, sync commit), fsb 1000, concurrent with first pass
+host RESULT ops/s=298.0 p50=2963
+host RESULT ops/s=287.2 p50=3053
+host RESULT ops/s=222.0 p50=3045
