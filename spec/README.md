@@ -507,4 +507,3 @@ native FUA, sync is one flush plus one FUA write. On a drive without
 power-loss protection, I expect the FUA write to cost about what a flush
 does, but I have not measured it. With power-loss protection a flush is
 cheap and the gain should shrink.
-\n
