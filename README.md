@@ -1,3 +1,22 @@
+# episode
+
+This repository holds three related lines of work. Each one grew out of the
+one before it.
+
+| Thread | Where | Status (2026-10-27) |
+|---|---|---|
+| **Episode, model-checked**: TLA+ models of the Episode file system's log and recovery (DCE 1.2.2), checked against 1992 and modern device contracts, plus Linux jbd2 | [`spec/`](spec/README.md) | Active. 17 findings. A jbd2 fix is drafted in `spec/fix/` and deliberately unsent (narrow scope). One open item. |
+| **AssFS**: a graph-namespace FUSE filesystem built on Episode-style logging | `src/`, `tests/`, `docs/` (below) | Dormant by decision since 2026-02-22. Needs `libfuse3-dev` to build. |
+| **Memory-Shaped Storage**: a survey and behavioural study of how LLM agents want a filesystem namespace to work | `scripts/`, [`docs/paper-outline.md`](docs/paper-outline.md) | Dormant. The FAST 2026 target passed; whether the claims still hold is an open question. |
+
+Also here:
+- `sealed/` holds findings committed for tupay's blind D2 comparison. **Don't
+  read it if you're working on tupay.** See
+  [`docs/requests/`](docs/requests/) for what was asked and answered.
+- `docs/steward/log.md` is the steward's log: decisions, reasons and errors.
+
+The rest of this README describes AssFS.
+
 # AssFS — Associative File System
 
 AssFS is a FUSE filesystem that replaces the traditional directory tree with a
