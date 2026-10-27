@@ -42,3 +42,16 @@ questions and gives advice when asked. Decisions are the steward's.
 - Rewrote the top of README.md to name all three threads; started this log.
 - Open for Tony, optional: ask Surbhi for her dissertation (SMR volume manager,
   FAST '27); install `libfuse3-dev` when AssFS wakes.
+
+## 2026-10-27 (recorded 18:16Z)
+
+- **tupay follow-up** (`docs/requests/2026-10-26-from-tupay-D2-followup.md`):
+  re-sealed as v2 (`b30107c`, sha256 `17368796…`) with explicit effect class
+  and env/own classification under D2's brief. Counts: env 4, own 3. v1's
+  contract wording for two bugs was wrong under that definition; this is
+  recorded in v2.
+- **Decision:** declined to encrypt `sealed/`. The same content is readable in
+  `spec/`, git history, khipumaq and public GitHub, so encryption would look
+  like custody without being custody. Offered help if tupay separates its
+  steward at the OS level.
+- `spec/tla-models` was first public on 2026-10-09 (GitHub activity API).
